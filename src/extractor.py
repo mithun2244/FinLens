@@ -31,7 +31,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from src import ExtractionError
-from src.config import get_settings
 from src.llm import get_chat_model, invoke_with_retry, llm_available
 from src.schemas import DocumentType, FinancialRecord, LineItem, ParsedDocument, TableBlock
 

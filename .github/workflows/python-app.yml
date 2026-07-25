@@ -1,39 +1,124 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+# CI for FinLens — Multimodal AI Financial Assistant.
+#
+# Two jobs so a red X says which half broke:
+#   quality — ruff + mypy. Seconds, no model downloads.
+#   test    — the offline pytest suite against real Docling/Chroma/MiniLM.
+#
+# The suite is free and offline by design (rules.md Rule 1): integration tests that hit
+# the live Groq API are excluded by pytest.ini's `-m "not integration"`, so CI never
+# spends the free-tier token budget and never needs a real credential.
 
 name: Python application
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
 
-jobs:
-  build:
+# A newer push makes an in-flight run obsolete; don't burn runner minutes on it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+env:
+  # `import src` must resolve from the repo root. pytest.ini also sets `pythonpath = .`,
+  # which is the real fix; this covers any step that invokes Python directly.
+  PYTHONPATH: .
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+
+jobs:
+  quality:
+    name: Lint and type-check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v3
-      with:
-        python-version: "3.10"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Test with pytest
-      run: |
-        pytest
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Deliberately does NOT install requirements.txt. ruff and mypy need only the
+      # source tree, so this job stays fast and independent of the heavy ML stack.
+      - name: Install lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+
+      # flake8 was replaced by ruff: it is already a declared dev dependency, it is
+      # substantially faster, and it enforces the same error classes. The old workflow's
+      # second flake8 pass used --exit-zero, so it could never fail a build — it was
+      # decorative. This one is real, but scoped to correctness rules, not style.
+      - name: Lint with ruff
+        run: ruff check src app.py ui scripts tests --select E9,F63,F7,F82,F401,F811
+
+      # The project is fully type-annotated (rules.md Rule 2.2), so this is a genuine
+      # gate. --ignore-missing-imports because several ML dependencies ship no stubs.
+      - name: Type-check with mypy
+        run: mypy src app.py ui --ignore-missing-imports
+
+  test:
+    name: Offline test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # CPU-only torch, installed BEFORE requirements.txt so the resolver sees an
+      # already-satisfied `torch>=2.2.0` and never reaches for the default PyPI wheel,
+      # which bundles ~2.5 GB of CUDA libraries a CPU runner cannot use.
+      #
+      # torchvision and torchaudio are deliberately omitted: requirements.txt declares
+      # only `torch`, sentence-transformers needs only `torch`, and pulling the other two
+      # would add download time for packages this project never imports.
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+
+      # Docling's layout/TableFormer models and the MiniLM embedding model are ~600 MB
+      # fetched from the HuggingFace Hub on first use. Caching keeps subsequent runs off
+      # the network, which is both faster and less flaky than re-downloading every push.
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: hf-models-${{ runner.os }}-
+
+      # Fixtures are committed, but regenerating proves make_fixtures.py still runs and
+      # that its built-in arithmetic assertions hold. Synthetic data only — no real
+      # financial documents exist in this repository (rules.md Rule 4).
+      - name: Generate synthetic fixtures
+        run: python scripts/make_fixtures.py
+
+      - name: Run offline test suite
+        # The suite passes with no credential at all — verified locally by unsetting the
+        # variable. This dummy value is belt-and-braces so a future test that reads the
+        # environment during import cannot fail on a missing key.
+        #
+        # Trade-off worth knowing: any non-placeholder value makes `groq_configured`
+        # return True, so a future test that reaches a real client would attempt a live
+        # call and fail with an auth error rather than skipping. If that becomes a
+        # nuisance, drop this env block — CI does not need it today.
+        env:
+          GROQ_API_KEY: gsk_dummy_key_for_ci_testing_only
+        run: pytest -v --durations=10

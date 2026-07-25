@@ -28,7 +28,6 @@ import logging
 import re
 import sys
 import time
-from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal

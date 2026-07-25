@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import (  # noqa: E402
     CHROMA_DIR,
-    COLLECTION_DOCUMENTS,
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     PROJECT_ROOT,

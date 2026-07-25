@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from src import LLMError, RateLimitError
 from src.config import MODELS_BY_ROLE, REASONING_MODEL
