@@ -462,3 +462,51 @@ def test_followup_resolves_against_history(indexed: FinancialRecord) -> None:
     ]
     answer = answer_question("And what was it the month before?", record=indexed, history=history)
     assert "98.03" in answer.text or answer.refused
+
+
+# ── Retrieved set vs cited set (evaluation correctness) ──────────────────────
+
+
+def test_answer_carries_the_full_retrieved_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: evaluation scored retrieval metrics against citations.
+
+    An answer typically cites one or two of ten retrieved chunks. Feeding citations to
+    Ragas as `retrieved_contexts` scored context_precision 0.077 and faithfulness 0.15 on
+    a pipeline whose extraction was 100% correct — a measurement artefact, not a quality
+    finding.
+    """
+
+    class _Model:
+        def stream(self, *_a: object, **_k: object):  # type: ignore[no-untyped-def]
+            yield type("C", (), {"content": "The total is 501.27 [clean_invoice.pdf:1]."})()
+
+    import src.chain as chain
+
+    hits = [
+        _citation("clean_invoice.pdf", 1, "Total amount: 501.27"),
+        _citation("clean_invoice.pdf", 1, "Subtotal: 462.00"),
+    ]
+    policy = [_citation("cloud_billing_policy.md", 1, "NAT Gateway is billed per GB")]
+
+    monkeypatch.setattr(chain, "llm_available", lambda: True)
+    monkeypatch.setattr(chain, "retrieve_with_policies", lambda *a, **k: (hits, policy))
+    monkeypatch.setattr(chain, "get_chat_model", lambda *a, **k: _Model())
+
+    answer = next(
+        e.answer
+        for e in stream_answer("What is the total?")
+        if e.type == "answer" and e.answer
+    )
+
+    assert len(answer.retrieved) == 3, "retrieved must hold every chunk, cited or not"
+    assert len(answer.citations) == 1, "only one chunk was actually cited"
+    assert len(answer.retrieved) > len(answer.citations)
+    snippets = {c.snippet for c in answer.retrieved}
+    assert "NAT Gateway is billed per GB" in snippets, "policy hits must be included"
+
+
+def test_retrieved_is_empty_when_nothing_was_retrieved() -> None:
+    from src.schemas import Answer
+
+    answer = Answer(question="q", text="t", model="m", latency_seconds=0.0)
+    assert answer.retrieved == []

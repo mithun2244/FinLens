@@ -402,6 +402,16 @@ class Answer(_Base):
     question: str
     text: str
     citations: list[Citation] = Field(default_factory=list)
+    #: Everything retrieval returned, not only what the model chose to cite.
+    #:
+    #: These are different sets and conflating them corrupts evaluation. Ragas'
+    #: context_precision and context_recall are *retrieval* metrics: scoring them against
+    #: citations measures which chunks the model referenced, and since an answer typically
+    #: cites one or two of ten retrieved chunks, recall against a full reference answer is
+    #: near-zero by construction. Faithfulness has the same problem — judged against two
+    #: snippets, a correct answer looks unfaithful because the supporting facts were never
+    #: shown to the judge.
+    retrieved: list[Citation] = Field(default_factory=list)
     numeric_checks: list[NumericCheck] = Field(default_factory=list)
     model: str
     latency_seconds: float = Field(ge=0.0)

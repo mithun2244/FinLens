@@ -252,3 +252,63 @@ def test_judge_construction_refuses_without_a_groq_key(monkeypatch: pytest.Monke
     monkeypatch.setattr(config.Settings, "groq_configured", property(lambda self: False))
     with pytest.raises(AssistantError, match="GROQ_API_KEY"):
         _build_judge()
+
+
+# ── The verdict must never claim more than was measured ──────────────────────
+
+
+def _errored(kind: str = "document") -> ItemResult:
+    item = GoldenItem(id="e", kind=kind, question="q", reference="r")  # type: ignore[arg-type]
+    result = ItemResult(item=item)
+    result.error = "The local search index is corrupt and cannot be read."
+    return result
+
+
+def test_a_run_where_everything_errored_cannot_pass() -> None:
+    """Regression: 28/28 errored on a corrupt store and the suite printed
+    "PASS - all targets met". Every grounding rate was vacuously 0 and every Ragas
+    mean was None, so nothing tripped the verdict."""
+    from src.evals import print_report
+
+    answers = [_errored() for _ in range(28)]
+    report = print_report([], answers, grounding_summary(answers), 1.0)
+
+    assert report["below_target"], "a run that measured nothing must not pass"
+    assert any("errored_items" in name for name in report["below_target"])
+
+
+def test_unmeasured_ragas_metrics_fail_the_run() -> None:
+    """A metric that failed to run must not be silently treated as absent."""
+    from src.evals import print_report
+
+    answers = [_result("document")]  # answered, but never scored
+    report = print_report([], answers, grounding_summary(answers), 1.0)
+
+    assert any("unmeasured:" in name for name in report["below_target"])
+
+
+def test_extraction_only_run_does_not_demand_ragas_metrics() -> None:
+    """`--extraction` legitimately skips scoring, so absent metrics are not a failure."""
+    from src.evals import print_report
+
+    report = print_report([], [], grounding_summary([]), 1.0)
+    assert not any("unmeasured:" in name for name in report["below_target"])
+
+
+def test_the_new_guards_do_not_misfire_on_a_scored_run() -> None:
+    """The guard must not be so strict that a genuinely measured run cannot pass.
+
+    Extraction targets are excluded here — this call passes no extraction results, so
+    those legitimately read as 0%. What matters is that neither new guard fires.
+    """
+    from src.evals import print_report
+
+    good = _result("document")
+    good.faithfulness = 0.95
+    good.answer_relevancy = 0.90
+    good.context_precision = 0.95
+    good.context_recall = 0.95
+    report = print_report([], [good], grounding_summary([good]), 1.0)
+
+    assert not any("errored_items" in name for name in report["below_target"])
+    assert not any("unmeasured:" in name for name in report["below_target"])

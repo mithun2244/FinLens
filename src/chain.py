@@ -469,6 +469,7 @@ def stream_answer(
             question=question,
             text=text,
             citations=citations,
+            retrieved=available,
             numeric_checks=cross_check_numbers(text, record, available),
             dropped_citations=dropped,
             refused=_looks_like_refusal(text),

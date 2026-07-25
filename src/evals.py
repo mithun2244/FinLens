@@ -314,11 +314,19 @@ async def _score_item(
     if answer is None:
         return
 
-    # Trimmed to stay inside the free tier's tokens-per-minute budget. The judge needs
-    # enough context to verify a claim, not the whole retrieval set (decision D-27).
+    # What retrieval returned, NOT what the model cited (decision D-36).
+    #
+    # context_precision and context_recall are retrieval metrics, and faithfulness judges
+    # the answer against the context the model was given. Passing citations instead scored
+    # 0.077 precision and 0.15 faithfulness on a pipeline whose extraction is exactly
+    # right — an artefact of showing the judge two snippets out of ten.
+    #
+    # Still trimmed, because the free tier limits tokens per minute (D-27), but trimmed
+    # from the retrieval set rather than substituted for it.
+    source = answer.retrieved or answer.citations
     contexts = [
-        citation.snippet[:MAX_CONTEXT_CHARS] for citation in answer.citations[:MAX_CONTEXTS]
-    ] or ["(no context was cited)"]
+        citation.snippet[:MAX_CONTEXT_CHARS] for citation in source[:MAX_CONTEXTS]
+    ] or ["(no context was retrieved)"]
     question, reference = result.item.question, result.item.reference
 
     async def safe(name: str, factory: Any) -> float | None:
@@ -599,6 +607,17 @@ def print_report(
         "field_accuracy": field_accuracy,
     }
     failures = [name for name in TARGETS if _verdict(name, measured.get(name)) == "FAIL"]
+
+    # An evaluator that reports PASS having measured nothing is worse than no evaluator:
+    # it manufactures confidence. Both of these fired on a run where all 28 questions
+    # errored on a corrupt vector store — every grounding rate was vacuously 0, every
+    # Ragas mean was None, and the run printed "PASS - all targets met".
+    if grounding["errored"]:
+        failures.append(f"errored_items({grounding['errored']})")
+    if answers:
+        unmeasured = [name for name in means if means[name] is None]
+        if unmeasured:
+            failures.extend(f"unmeasured:{name}" for name in unmeasured)
 
     # Grounding rates are pass/fail at zero, not against a threshold: a single answer
     # containing an invented figure or an invented citation is a correctness bug, and
