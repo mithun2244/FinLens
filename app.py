@@ -52,7 +52,12 @@ from src.config import (
 from src.extractor import extract_record
 from src.parser import parse_document, warm_up
 from src.schemas import RunStats
-from src.vectorstore import collection_stats, ingest_document, ingest_policy_files
+from src.vectorstore import (
+    collection_stats,
+    ingest_document,
+    ingest_policy_files,
+)
+from src.vectorstore import warm_up as warm_embeddings
 from ui.components import (
     app_header,
     empty_workspace,
@@ -102,8 +107,19 @@ def _init_state() -> None:
 
 @st.cache_resource(show_spinner=False)
 def _warm_models() -> bool:
-    """Load Docling's models once at startup so the first upload is not the slow one."""
+    """Load every heavy model once per process, before the first upload.
+
+    ``st.cache_resource`` runs this exactly once and keeps the result across reruns and
+    across browser sessions. The models themselves are held by ``lru_cache`` inside
+    ``src/`` — verified staying resident across uploads — so this is about *when* the
+    cost is paid, not whether the objects persist. ``src/`` never imports Streamlit
+    (decision D-8), which is why the decorator lives here rather than next to the loaders.
+
+    Measured on a cold start: Docling converter 8.6 s, MiniLM 3.6 s. Both used to land on
+    whoever uploaded first.
+    """
     warm_up(with_ocr=False)
+    warm_embeddings()
     return True
 
 
@@ -402,7 +418,7 @@ def main() -> None:
     _init_state()
 
     if not st.session_state.warmed:
-        with st.spinner("Loading local document models (one-time, ~20s)…"):
+        with st.spinner("Loading local document and embedding models (one-time, ~12s)…"):
             _warm_models()
         st.session_state.warmed = True
 

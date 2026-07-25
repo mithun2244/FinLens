@@ -19,10 +19,12 @@ model, and page images never leave the machine.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import time
 import uuid
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,11 +32,14 @@ from typing import TYPE_CHECKING, Any
 from src import ParsingError
 from src.config import (
     DOCLING_IMAGE_SCALE,
+    DOCLING_NUM_THREADS,
     EXPECTED_CHARS_PER_PAGE,
     IMAGE_EXTENSIONS,
     MAX_UPLOAD_BYTES,
+    MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER,
     OCR_LANGUAGES,
     OCR_TEXT_SCORE,
+    PARSE_CACHE_SIZE,
     SUPPORTED_EXTENSIONS,
     TABLE_MODE_ACCURATE,
     UPLOAD_DIR,
@@ -47,7 +52,78 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["parse_document", "page_image_dir", "warm_up"]
+__all__ = [
+    "parse_document",
+    "page_image_dir",
+    "warm_up",
+    "has_text_layer",
+    "parse_cache_info",
+    "clear_parse_cache",
+]
+
+
+# ── Fast-path triage and result cache ────────────────────────────────────────
+
+#: Parsed documents keyed by (content hash, ocr flag). Re-uploading a file already parsed
+#: in this process returns immediately instead of re-running the layout models.
+_PARSE_CACHE: OrderedDict[tuple[str, bool], ParsedDocument] = OrderedDict()
+
+
+def _content_hash(path: Path) -> str:
+    """MD5 of the file's bytes. Identity is the content, not the name or the path."""
+    digest = hashlib.md5()  # noqa: S324 - cache key, not a security primitive
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def has_text_layer(path: Path) -> tuple[bool, int, int]:
+    """Cheaply decide whether a PDF already carries extractable text.
+
+    Runs PyMuPDF over the file — 1-10 ms against Docling's seconds — purely to choose the
+    right pipeline up front. Without it, a scanned PDF is parsed **twice**: once to
+    discover the text yield is too low, then again with OCR enabled.
+
+    This is triage only. The extracted text is deliberately discarded: PyMuPDF returns a
+    flat character stream with no table structure, and line items come from Docling's
+    TableFormer rows (decision D-7). Substituting raw text here would make every invoice
+    fall back to narrative pattern-matching at 0.55 confidence and cost the line-item
+    recall the product is built on.
+
+    Returns:
+        ``(has_text, page_count, total_chars)``. ``has_text`` is ``False`` for images and
+        for anything PyMuPDF cannot open, so the caller falls back to OCR.
+    """
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        return False, 1, 0
+
+    try:
+        import fitz
+    except ImportError:  # pragma: no cover - PyMuPDF is a declared dependency
+        logger.debug("PyMuPDF unavailable; skipping fast-path triage")
+        return True, 0, 0
+
+    try:
+        with fitz.open(path) as document:
+            pages = document.page_count or 1
+            chars = sum(len(page.get_text("text") or "") for page in document)
+    except Exception as exc:  # noqa: BLE001 - triage must never block parsing
+        logger.debug("Triage could not read %s (%s); deferring to Docling", path.name, exc)
+        return True, 0, 0
+
+    per_page = chars / max(1, pages)
+    return per_page >= MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER, pages, chars
+
+
+def parse_cache_info() -> dict[str, int]:
+    """Size and capacity of the in-process parse cache."""
+    return {"entries": len(_PARSE_CACHE), "capacity": PARSE_CACHE_SIZE}
+
+
+def clear_parse_cache() -> None:
+    """Drop every cached parse. Used by tests and by an explicit user 'reprocess'."""
+    _PARSE_CACHE.clear()
 
 
 # ── Converter construction (expensive — built once, cached) ───────────────────
@@ -63,6 +139,8 @@ def _get_converter(with_ocr: bool) -> Any:
     """
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
         PdfPipelineOptions,
         RapidOcrOptions,
         TableFormerMode,
@@ -75,6 +153,12 @@ def _get_converter(with_ocr: bool) -> Any:
     )
 
     options = PdfPipelineOptions()
+    # Docling defaults to 4 threads and sets torch's thread count itself, so this must be
+    # configured here — torch.set_num_threads() from application code is overridden and
+    # has no effect. Worth 42% of parse time on a 12-core machine (config.py).
+    options.accelerator_options = AcceleratorOptions(
+        num_threads=DOCLING_NUM_THREADS, device=AcceleratorDevice.CPU
+    )
     options.do_ocr = with_ocr
     options.do_table_structure = True
     # Assigned as a whole rather than mutated field-by-field: the attribute is declared as
@@ -429,15 +513,38 @@ def parse_document(
     is_image = path.suffix.lower() in IMAGE_EXTENSIONS
     started = time.perf_counter()
 
-    # An image file has no text layer by definition — going through a non-OCR pass first
-    # would waste ~15 s to learn what the file extension already told us.
+    # Fast-path triage. An image has no text layer by definition; for a PDF, PyMuPDF
+    # answers the same question in milliseconds. Deciding here means a scanned PDF goes
+    # straight to the OCR pipeline instead of being parsed once to discover it needs OCR
+    # and then parsed again.
     if force_ocr is None:
-        first_pass_ocr = is_image and settings.ocr_enabled
+        if is_image:
+            first_pass_ocr = settings.ocr_enabled
+        else:
+            text_layer, pages, chars = has_text_layer(path)
+            first_pass_ocr = (not text_layer) and settings.ocr_enabled
+            logger.info(
+                "Triage %s: %d page(s), %d chars, text_layer=%s -> ocr=%s",
+                path.name, pages, chars, text_layer, first_pass_ocr,
+            )
     else:
         first_pass_ocr = force_ocr
 
+    cache_key = (_content_hash(path), first_pass_ocr)
+    cached = _PARSE_CACHE.get(cache_key)
+    if cached is not None:
+        _PARSE_CACHE.move_to_end(cache_key)
+        logger.info("Parse cache hit for %s (document_id=%s)", path.name, document_id)
+        if persist_source:
+            _persist_source(path, document_id)
+        # Same content, possibly a new identifier. Page images on disk stay valid because
+        # their paths are absolute and the rendered pages are identical.
+        return cached.model_copy(
+            update={"document_id": document_id, "parse_seconds": 0.0}
+        )
+
     logger.info(
-        "Parsing document_id=%s pages=? ocr=%s image=%s", document_id, first_pass_ocr, is_image
+        "Parsing document_id=%s ocr=%s image=%s", document_id, first_pass_ocr, is_image
     )
     result = _convert(path, with_ocr=first_pass_ocr)
     parsed = _build_parsed_document(
@@ -476,6 +583,11 @@ def parse_document(
 
     if persist_source:
         _persist_source(path, document_id)
+
+    _PARSE_CACHE[cache_key] = parsed
+    _PARSE_CACHE.move_to_end(cache_key)
+    while len(_PARSE_CACHE) > PARSE_CACHE_SIZE:
+        _PARSE_CACHE.popitem(last=False)
 
     logger.info(
         "document_id=%s parsed: %d pages, %d tables, %d rows, ocr=%s, %.1fs",

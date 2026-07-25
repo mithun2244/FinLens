@@ -13,6 +13,7 @@ makes that class of breakage a one-line fix. Verify liveness with
 from __future__ import annotations
 
 import logging
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
@@ -84,7 +85,44 @@ TABLE_MODE_ACCURATE: Final[bool] = True
 
 #: Docling page-image scale factor (1.0 == 72 DPI). 2.0 gives ~144 DPI, close to
 #: PAGE_RENDER_DPI, which is enough for the previewer without ballooning memory.
+#:
+#: Measured: turning page images off entirely saves nothing (3.63 s off vs 3.22 s on —
+#: inside run-to-run noise), so they stay on. They are what the document previewer and
+#: citation highlighting are built from.
 DOCLING_IMAGE_SCALE: Final[float] = 2.0
+
+#: Threads for Docling's layout and TableFormer models.
+#:
+#: This is the single largest parsing lever, and it is easy to miss: Docling's
+#: ``AcceleratorOptions`` defaults to **4 threads** and sets torch's thread count itself,
+#: so calling ``torch.set_num_threads()`` from application code is overridden and does
+#: nothing. Measured on a 12-core machine, one page, TableFormer ACCURATE:
+#:
+#:     num_threads=4   3.58 s   (Docling's default)
+#:     num_threads=8   2.20 s
+#:     num_threads=12  2.06 s   (-42%)
+#:
+#: Capped at 8 by default: the gain from 8 to 12 is small, and leaving headroom keeps the
+#: UI responsive while a document parses.
+DOCLING_NUM_THREADS: Final[int] = max(1, min(8, (os.cpu_count() or 4)))
+
+#: Minimum extracted characters per page for a PDF to count as having a text layer.
+#:
+#: Used by the PyMuPDF triage pass to decide OCR *before* invoking Docling, which avoids
+#: parsing a scanned document twice. Deliberately low. Measured on the fixture set:
+#:
+#:     scanned_receipt.png        0 chars/page
+#:     multipage_statement.pdf  289 chars/page
+#:     clean_invoice.pdf        511 chars/page
+#:
+#: The question is "is there a text layer at all", not "is this page dense". A threshold
+#: near 100 words/page (~500 chars) would wrongly send the sparse two-page statement
+#: through OCR; 50 separates the real cases with a wide margin.
+MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER: Final[int] = 50
+
+#: How many parsed documents to keep in the in-process cache, keyed by content hash.
+#: Re-uploading a file already parsed in this session returns instantly.
+PARSE_CACHE_SIZE: Final[int] = 16
 
 # ── Local embedding model (decision D-2: embeddings never leave the machine) ──
 

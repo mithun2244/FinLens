@@ -9,6 +9,8 @@ No LLM is called anywhere in this module — parsing is entirely local (decision
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from src import ParsingError
@@ -218,3 +220,114 @@ def test_error_messages_contain_no_stack_traces() -> None:
     message = str(excinfo.value)
     for leak in ("Traceback", "NoneType", "Exception:", "  File \""):
         assert leak not in message
+
+
+# ── Fast-path triage and result caching (performance work) ───────────────────
+
+
+def test_triage_detects_a_text_layer() -> None:
+    """Digital PDFs must be recognised without invoking Docling."""
+    from src.parser import has_text_layer
+
+    for fixture in (CLEAN, UNBALANCED, MULTIPAGE):
+        has_text, pages, chars = has_text_layer(fixture)
+        assert has_text, f"{fixture.name} should report a text layer"
+        assert pages >= 1 and chars > 0
+
+
+def test_triage_detects_a_scanned_image() -> None:
+    from src.parser import has_text_layer
+
+    has_text, _, chars = has_text_layer(SCANNED)
+    assert not has_text
+    assert chars == 0
+
+
+def test_triage_threshold_separates_the_real_cases() -> None:
+    """A sparse multi-page statement must not be mistaken for a scan.
+
+    The threshold answers "is there a text layer at all", not "is this page dense".
+    Measured: scanned 0 chars/page, statement 289, invoice 511.
+    """
+    from src.config import MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER
+    from src.parser import has_text_layer
+
+    _, pages, chars = has_text_layer(MULTIPAGE)
+    assert chars / pages > MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER
+
+
+def test_triage_never_raises_on_a_corrupt_file() -> None:
+    """Triage is an optimisation; it must never be what fails a parse.
+
+    PyMuPDF opens this truncated file (the %PDF header is intact) and reports no pages,
+    so triage reports no text layer. Either answer is acceptable — what matters is that
+    it returns rather than raising, and that Docling still produces the actionable error.
+    """
+    from src.parser import has_text_layer
+
+    has_text, pages, chars = has_text_layer(MALFORMED)
+    assert isinstance(has_text, bool)
+    assert chars == 0
+
+    with pytest.raises(ParsingError):
+        parse_document(MALFORMED, persist_source=False)
+
+
+def test_triage_on_unreadable_bytes_defers_to_docling(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """When PyMuPDF cannot open the file at all, the decision is handed to Docling."""
+    from src.parser import has_text_layer
+
+    junk = tmp_path / "junk.pdf"
+    junk.write_bytes(b"this is not a pdf at all")
+    has_text, _, _ = has_text_layer(junk)
+    assert has_text is True  # unknown -> let Docling decide and raise properly
+
+
+def test_reparsing_the_same_file_hits_the_cache() -> None:
+    from src.parser import clear_parse_cache, parse_cache_info
+
+    clear_parse_cache()
+    parse_document(CLEAN, document_id="cache-1", persist_source=False)
+    assert parse_cache_info()["entries"] == 1
+
+    started = time.perf_counter()
+    again = parse_document(CLEAN, document_id="cache-2", persist_source=False)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0, f"cache hit took {elapsed:.2f}s"
+    assert again.document_id == "cache-2", "the caller's document_id must be honoured"
+
+
+def test_cached_parse_returns_equivalent_content() -> None:
+    """A cache hit must not be a degraded result."""
+    from src.parser import clear_parse_cache
+
+    clear_parse_cache()
+    first = parse_document(CLEAN, document_id="eq-1", persist_source=False)
+    second = parse_document(CLEAN, document_id="eq-2", persist_source=False)
+
+    assert second.page_count == first.page_count
+    assert len(second.tables) == len(first.tables)
+    assert second.tables[0].rows == first.tables[0].rows
+    assert second.markdown == first.markdown
+
+
+def test_cache_is_keyed_on_content_not_filename(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The same bytes under a different name is still a hit."""
+    from src.parser import clear_parse_cache, parse_cache_info
+
+    clear_parse_cache()
+    parse_document(CLEAN, document_id="name-1", persist_source=False)
+    copy = tmp_path / "renamed.pdf"
+    copy.write_bytes(CLEAN.read_bytes())
+    parse_document(copy, document_id="name-2", persist_source=False)
+    assert parse_cache_info()["entries"] == 1
+
+
+def test_cache_reports_zero_parse_seconds_on_a_hit() -> None:
+    """The Observability Bar should show a hit as free, not as a fast parse."""
+    from src.parser import clear_parse_cache
+
+    clear_parse_cache()
+    parse_document(CLEAN, document_id="secs-1", persist_source=False)
+    assert parse_document(CLEAN, document_id="secs-2", persist_source=False).parse_seconds == 0.0
