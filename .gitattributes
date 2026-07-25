@@ -1,0 +1,17 @@
+# Normalize line endings so the repository is byte-identical across platforms.
+# Without this, a clone on Linux or macOS shows every text file as modified, because
+# it was committed from Windows with CRLF.
+* text=auto eol=lf
+
+# Binary fixtures and screenshots must never be line-ending converted — doing so
+# corrupts them.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.webp binary
+*.pdf  binary
+*.onnx binary
+*.db   binary
+
+# JSONL is one record per line; keep diffs line-oriented.
+*.jsonl text eol=lf

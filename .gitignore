@@ -1,0 +1,69 @@
+# ── Secrets (rules.md Rule 4) ─────────────────────────────────────────────────
+.env
+.env.local
+*.key
+secrets/
+
+# ── Data — NEVER commit financial documents or derived indexes (Rule 4) ───────
+# Covers data/uploads/, data/chroma/, data/llm_cache.db and any stray run logs.
+# Deliberately no .gitkeep exception: a negation cannot rescue a file from an excluded
+# directory, and src/config.ensure_directories() recreates the tree on first run anyway.
+data/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+# Synthetic evaluation fixtures ARE committed; real documents never are.
+!evals/fixtures/**
+# README screenshots. Synthetic documents only — see scripts/make_fixtures.py.
+!docs/**
+
+# ── Python ────────────────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Tooling caches ────────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# ── Model caches (large, re-downloadable, free) ───────────────────────────────
+.cache/
+huggingface/
+*.onnx
+*.safetensors
+*.bin
+
+# ── Streamlit ─────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── Eval output ───────────────────────────────────────────────────────────────
+# Timestamped run reports are local artefacts, not source.
+evals/reports/
+
+# ── Agent tooling ─────────────────────────────────────────────────────────────
+# Per-machine permission allowlist: absolute local paths and the developer's username.
+# .claude/settings.json (shared config) would still be committed if one is ever added.
+.claude/settings.local.json
+
+# ── Editors / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+.gstack/

@@ -1,0 +1,20 @@
+# Streamlit configuration.
+#
+# maxUploadSize must match MAX_UPLOAD_BYTES in src/config.py. Streamlit's default is
+# 200 MB, which contradicted the "up to 25 MB" text in the dropzone and would have let a
+# user wait through a long upload only to hit our own validation error afterwards.
+
+[server]
+maxUploadSize = 25
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#0F766E"
+backgroundColor = "#FAFAFA"
+secondaryBackgroundColor = "#F1F2F4"
+textColor = "#16181D"
+font = "sans serif"
