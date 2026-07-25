@@ -312,3 +312,89 @@ def test_the_new_guards_do_not_misfire_on_a_scored_run() -> None:
 
     assert not any("errored_items" in name for name in report["below_target"])
     assert not any("unmeasured:" in name for name in report["below_target"])
+
+
+# ── --kinds filter ───────────────────────────────────────────────────────────
+
+
+def test_kinds_filter_selects_only_that_kind() -> None:
+    items = load_golden_set(kinds=["refusal"])
+    assert items
+    assert {i.kind for i in items} == {"refusal"}
+
+
+def test_kinds_filter_accepts_several_kinds() -> None:
+    items = load_golden_set(kinds=["policy", "cross_document", "refusal"])
+    assert {i.kind for i in items} == {"policy", "cross_document", "refusal"}
+    assert "document" not in {i.kind for i in items}
+
+
+def test_kinds_filter_partitions_the_golden_set_exactly() -> None:
+    """Every item belongs to exactly one slice — no double-counting, no gaps."""
+    from src.evals import ITEM_KINDS
+
+    total = len(load_golden_set())
+    partitioned = sum(len(load_golden_set(kinds=[k])) for k in ITEM_KINDS)
+    assert partitioned == total
+
+
+def test_unknown_kind_is_rejected_with_the_valid_options() -> None:
+    from src import AssistantError
+
+    with pytest.raises(AssistantError, match="Unknown question kind"):
+        load_golden_set(kinds=["nonsense"])
+
+
+def test_kinds_and_limit_compose() -> None:
+    assert len(load_golden_set(kinds=["policy"], limit=2)) == 2
+
+
+def test_no_kinds_returns_everything() -> None:
+    assert len(load_golden_set(kinds=None)) == len(load_golden_set())
+
+
+def test_kinds_flag_is_actually_wired_into_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: --kinds was parsed but never passed to load_golden_set.
+
+    The flag was accepted in silence and the run evaluated all 28 questions anyway,
+    which is worse than rejecting it — an argument that appears to work but does
+    nothing produces confident, wrongly-scoped results.
+    """
+    import src.evals as evals
+
+    seen: dict[str, object] = {}
+
+    def _capture(path=None, limit=None, kinds=None):  # type: ignore[no-untyped-def]
+        seen["kinds"] = kinds
+        seen["limit"] = limit
+        return []
+
+    monkeypatch.setattr(evals, "load_golden_set", _capture)
+    monkeypatch.setattr(evals, "build_index", lambda **_: {})
+    monkeypatch.setattr(evals, "evaluate_extraction", lambda *_a, **_k: [])
+    monkeypatch.setattr(evals, "print_report", lambda *a, **k: {"below_target": []})
+    monkeypatch.setattr(evals, "configure_logging", lambda: None)
+
+    evals.main(["--kinds", "policy,refusal", "--no-score"])
+
+    assert seen["kinds"] == ["policy", "refusal"], "the flag must reach load_golden_set"
+
+
+def test_kinds_flag_strips_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--kinds "policy, refusal"` must work as well as the unspaced form."""
+    import src.evals as evals
+
+    seen: dict[str, object] = {}
+
+    def _capture(path=None, limit=None, kinds=None):  # type: ignore[no-untyped-def]
+        seen["kinds"] = kinds
+        return []
+
+    monkeypatch.setattr(evals, "load_golden_set", _capture)
+    monkeypatch.setattr(evals, "build_index", lambda **_: {})
+    monkeypatch.setattr(evals, "evaluate_extraction", lambda *_a, **_k: [])
+    monkeypatch.setattr(evals, "print_report", lambda *a, **k: {"below_target": []})
+    monkeypatch.setattr(evals, "configure_logging", lambda: None)
+
+    evals.main(["--kinds", "policy, refusal", "--no-score"])
+    assert seen["kinds"] == ["policy", "refusal"]

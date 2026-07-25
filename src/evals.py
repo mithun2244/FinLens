@@ -28,6 +28,7 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -147,14 +148,42 @@ class ExtractionResult:
     skipped_fields: list[str] = field(default_factory=list)
 
 
-def load_golden_set(path: Path = GOLDEN_SET_PATH, limit: int | None = None) -> list[GoldenItem]:
+ITEM_KINDS: tuple[str, ...] = ("document", "policy", "cross_document", "refusal")
+
+
+def load_golden_set(
+    path: Path = GOLDEN_SET_PATH,
+    limit: int | None = None,
+    kinds: Sequence[str] | None = None,
+) -> list[GoldenItem]:
+    """Load the golden set, optionally filtered by question kind.
+
+    ``kinds`` exists because of the free tier: a full run costs roughly twice the
+    100k tokens/day budget (decision D-27), so an all-or-nothing run reliably dies
+    part-way and reports on whatever happened to finish first. Splitting by kind makes
+    each slice affordable and, more importantly, makes coverage deliberate — the last
+    truncated run silently evaluated only ``document`` questions and left the refusal
+    cases, which are the ones that actually test grounding, unmeasured.
+    """
     if not path.exists():
         raise AssistantError(f"Golden set not found at {path}.")
+
+    if kinds:
+        unknown = sorted(set(kinds) - set(ITEM_KINDS))
+        if unknown:
+            raise AssistantError(
+                f"Unknown question kind(s): {', '.join(unknown)}. "
+                f"Choose from: {', '.join(ITEM_KINDS)}."
+            )
+
+    wanted = set(kinds) if kinds else None
     items: list[GoldenItem] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         raw = json.loads(line)
+        if wanted is not None and raw["kind"] not in wanted:
+            continue
         items.append(
             GoldenItem(
                 id=raw["id"],
@@ -164,6 +193,9 @@ def load_golden_set(path: Path = GOLDEN_SET_PATH, limit: int | None = None) -> l
                 document_id=raw.get("document_id"),
             )
         )
+
+    if wanted is not None and not items:
+        raise AssistantError(f"No golden items match kind(s): {', '.join(sorted(wanted))}.")
     return items[:limit] if limit else items
 
 
@@ -685,6 +717,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-score", action="store_true", help="answer questions but skip Ragas scoring")
     parser.add_argument("--limit", type=int, default=None, help="only the first N golden items")
     parser.add_argument(
+        "--kinds",
+        type=str,
+        default=None,
+        help=(
+            "comma-separated question kinds to run: "
+            + ", ".join(ITEM_KINDS)
+            + ". Splits a run that would otherwise exceed the daily token budget."
+        ),
+    )
+    parser.add_argument(
         "--pace",
         type=float,
         default=DEFAULT_PACE,
@@ -706,8 +748,13 @@ def main(argv: list[str] | None = None) -> int:
         elapsed = time.perf_counter() - started
         report = print_report(extraction, [], grounding_summary([]), elapsed)
     else:
-        items = load_golden_set(limit=args.limit)
-        print(f"\nAnswering {len(items)} golden questions (pace={args.pace}s)...", flush=True)
+        kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
+        items = load_golden_set(limit=args.limit, kinds=kinds)
+        scope = f" [{', '.join(kinds)}]" if kinds else " [all kinds]"
+        print(
+            f"\nAnswering {len(items)} golden questions{scope} (pace={args.pace}s)...",
+            flush=True,
+        )
         answers = asyncio.run(
             evaluate_answers(items, records, score=not args.no_score, pace=args.pace)
         )
