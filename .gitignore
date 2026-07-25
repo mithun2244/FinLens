@@ -50,6 +50,14 @@ huggingface/
 # ── Streamlit ─────────────────────────────────────────────────────────────────
 .streamlit/secrets.toml
 
+# ── Next.js frontend ──────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/next-env.d.ts
+frontend/.env*.local
+
 # ── Eval output ───────────────────────────────────────────────────────────────
 # Timestamped run reports are local artefacts, not source.
 evals/reports/

@@ -83,11 +83,19 @@ langsmith>=0.1.100
 pandas>=2.2.0
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
-# Streamlit + heavy custom CSS is the Phase 5 default (design.md §2, decision D-9).
-# The framework decision is formally made at the START of Phase 5 — if we go React,
-# this line is replaced by fastapi + uvicorn and src/ is reused verbatim (D-8).
-# Cost: $0 (Apache-2.0).
+# Two frontends now run against the same src/, which is what decision D-8 was for.
+# Cost: $0 (Apache-2.0 / MIT).
+#
+# Streamlit dashboard:  streamlit run app.py
 streamlit>=1.38.0
+#
+# FastAPI backend for the Next.js frontend in frontend/:
+#   uvicorn api:app --port 8000
+# python-multipart is required for multipart/form-data uploads; FastAPI raises a clear
+# error without it, but only at request time, so it is pinned explicitly.
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
 
 # ── Development ───────────────────────────────────────────────────────────────
 # Cost: $0 (MIT/BSD).

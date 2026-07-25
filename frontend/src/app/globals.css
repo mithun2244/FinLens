@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+/* FinLens design tokens (design.md §3), dark-mode first.
+   Tailwind v4 is CSS-first: these @theme entries generate the utility classes, so
+   components reference `bg-surface-raised` rather than a hardcoded hex. */
+@theme {
+  --color-surface-base: #0f1115;
+  --color-surface-raised: #171a21;
+  --color-surface-sunken: #0b0d11;
+  --color-surface-hover: #1d212a;
+
+  --color-ink-primary: #eceef3;
+  --color-ink-secondary: #a0a7b6;
+  --color-ink-tertiary: #6b7280;
+
+  --color-edge-subtle: #232833;
+  --color-edge-default: #2e3543;
+  --color-edge-strong: #3d4655;
+
+  --color-brand-500: #2aa79a;
+  --color-brand-600: #0f766e;
+  --color-brand-glow: #14867c;
+
+  /* Semantic colours carry meaning, never decoration. Each is paired with an icon and
+     a text label in the components — a table of numbers must not encode state by
+     colour alone (design.md §7). */
+  --color-state-validated: #3dbf85;
+  --color-state-warning: #e3a008;
+  --color-state-error: #f0645b;
+  --color-state-info: #6699ff;
+
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+html {
+  background: var(--color-surface-base);
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-surface-base);
+  color: var(--color-ink-primary);
+}
+
+/* Every amount in this product is monospace with tabular figures so columns align on
+   the decimal point. Proportional digits in a financial table are a correctness
+   problem, not a taste one (design.md §3.2). */
+.tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-edge-default);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-edge-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
