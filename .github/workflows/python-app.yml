@@ -1,8 +1,12 @@
 # CI for FinLens — Multimodal AI Financial Assistant.
 #
-# Two jobs so a red X says which half broke:
-#   quality — ruff + mypy. Seconds, no model downloads.
-#   test    — the offline pytest suite against real Docling/Chroma/MiniLM.
+# Three jobs so a red X says which part broke:
+#   quality  — ruff + mypy over the Python source. Seconds, no model downloads.
+#   test     — the offline pytest suite against real Docling/Chroma/MiniLM.
+#   frontend — eslint + next build for the Next.js app in frontend/.
+#
+# The jobs are independent and run in parallel; a TypeScript error must not be reported
+# as a Python failure, or vice versa.
 #
 # The suite is free and offline by design (rules.md Rule 1): integration tests that hit
 # the live Groq API are excluded by pytest.ini's `-m "not integration"`, so CI never
@@ -146,3 +150,44 @@ jobs:
         env:
           GROQ_API_KEY: gsk_dummy_key_for_ci_testing_only
         run: pytest -v --durations=10
+
+  frontend:
+    name: Frontend build and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Next.js 16 requires Node >= 20.9.0 (declared in its package.json engines field).
+      # 22 is the current LTS and comfortably above that floor.
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          # The lockfile is not at the repository root, so the cache key needs an
+          # explicit path — without it the cache silently never hits.
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` rather than `npm install`: it installs exactly what the committed
+      # lockfile pins and fails if package.json and the lockfile have drifted apart,
+      # which is the behaviour a build should have.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # Catches TypeScript errors as well as build failures — `next build` runs tsc.
+      - name: Build
+        run: npm run build
+        env:
+          # The build prerenders the page, and the client reads this at module scope.
+          # It is a build-time default only; the running app talks to whatever the
+          # deployed environment sets.
+          NEXT_PUBLIC_API_BASE: http://localhost:8000
+          NEXT_TELEMETRY_DISABLED: "1"
