@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { AlertTriangle, ArrowUp, BookOpen, Quote, Square } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { AnswerPayload, ChatTurn, FinancialDocument } from "@/lib/api";
+import type { AnswerPayload, ChatTurn, Citation, FinancialDocument } from "@/lib/api";
 import { loadPolicies, streamChat } from "@/lib/api";
 
 interface Message {
@@ -18,6 +18,8 @@ interface Message {
 interface ChatPanelProps {
   document: FinancialDocument | null;
   onStats?: (tokens: number, seconds: number) => void;
+  /** Clicking a citation chip drives the document previewer. */
+  onCite?: (citation: Citation) => void;
 }
 
 const CITATION = /\[([^[\]]+?):\s*(?:p\.?\s*)?(\d+)\s*\]/g;
@@ -28,9 +30,13 @@ const CITATION = /\[([^[\]]+?):\s*(?:p\.?\s*)?(\d+)\s*\]/g;
  * A marker that matched no retrieved chunk is left as plain text rather than removed —
  * an invented reference must stay visible, not be silently swallowed (Rule 5).
  */
-function renderWithCitations(text: string, answer?: AnswerPayload) {
-  const known = new Set(
-    (answer?.citations ?? []).map((c) => `${c.filename.toLowerCase()}:${c.page}`)
+function renderWithCitations(
+  text: string,
+  answer?: AnswerPayload,
+  onCite?: (citation: Citation) => void
+) {
+  const known = new Map(
+    (answer?.citations ?? []).map((c) => [`${c.filename.toLowerCase()}:${c.page}`, c])
   );
   const nodes: React.ReactNode[] = [];
   let cursor = 0;
@@ -40,17 +46,23 @@ function renderWithCitations(text: string, answer?: AnswerPayload) {
   while ((match = CITATION.exec(text)) !== null) {
     if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
     const key = `${match[1].trim().toLowerCase()}:${Number(match[2])}`;
-    if (known.has(key)) {
+    const citation = known.get(key);
+    if (citation) {
       nodes.push(
-        <span
+        <button
           key={`${match.index}-cite`}
-          className="mx-0.5 inline-flex items-center gap-1 rounded-full bg-state-info/15 px-2 py-0.5 align-middle font-mono text-[10px] text-state-info"
+          type="button"
+          onClick={() => onCite?.(citation)}
+          title={citation.snippet}
+          className="mx-0.5 inline-flex items-center gap-1 rounded-full bg-state-info/15 px-2 py-0.5 align-middle font-mono text-[10px] text-state-info transition-colors hover:bg-state-info/30 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-state-info"
         >
           <Quote className="size-2.5" />
           {match[1].trim()} · p.{match[2]}
-        </span>
+        </button>
       );
     } else {
+      // An unresolved marker stays as plain text. An invented reference must remain
+      // visible, not be silently swallowed (Rule 5).
       nodes.push(match[0]);
     }
     cursor = match.index + match[0].length;
@@ -99,7 +111,7 @@ function WarningStrips({ answer }: { answer: AnswerPayload }) {
   );
 }
 
-export function ChatPanel({ document, onStats }: ChatPanelProps) {
+export function ChatPanel({ document, onStats, onCite }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -257,7 +269,7 @@ export function ChatPanel({ document, onStats }: ChatPanelProps) {
                 ) : (
                   <>
                     <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink-primary">
-                      {renderWithCitations(message.content, message.answer)}
+                      {renderWithCitations(message.content, message.answer, onCite)}
                     </p>
                     {message.answer && <WarningStrips answer={message.answer} />}
                     {message.answer && (

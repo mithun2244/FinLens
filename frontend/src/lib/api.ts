@@ -62,6 +62,20 @@ export interface FinancialDocument {
   suggested_prompts: string[];
 }
 
+/**
+ * A region on a page, normalized 0-1 with a top-left origin.
+ *
+ * The backend converts Docling's bottom-left absolute points once, at the boundary, so
+ * the client can position an overlay as CSS percentages without knowing page dimensions
+ * or dealing with coordinate systems.
+ */
+export interface BoundingBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
 export interface Citation {
   document_id: string;
   filename: string;
@@ -70,6 +84,13 @@ export interface Citation {
   snippet: string;
   score: number;
   chunk_type: string;
+  /** Null when Docling gave no provenance; the UI falls back to page-level highlight. */
+  bbox: BoundingBox | null;
+}
+
+/** URL of a rendered page image. Immutable per document, so it caches indefinitely. */
+export function pageImageUrl(documentId: string, page: number): string {
+  return `${API_BASE}/api/documents/${documentId}/pages/${page}`;
 }
 
 export interface ContradictingFigure {

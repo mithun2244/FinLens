@@ -35,7 +35,7 @@ from typing import Any, Literal  # noqa: E402
 
 from fastapi import FastAPI, File, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from src import AssistantError, ParsingError  # noqa: E402
@@ -379,6 +379,19 @@ def chat(request: ChatRequest) -> StreamingResponse:
                                 "snippet": c.snippet,
                                 "score": round(c.score, 3),
                                 "chunk_type": c.chunk_type,
+                                # Normalized 0-1, top-left origin, so the client can
+                                # place an overlay without knowing page dimensions
+                                # (decision D-16). Null when Docling gave no provenance.
+                                "bbox": (
+                                    {
+                                        "left": c.bbox.left,
+                                        "top": c.bbox.top,
+                                        "right": c.bbox.right,
+                                        "bottom": c.bbox.bottom,
+                                    }
+                                    if c.bbox
+                                    else None
+                                ),
                             }
                             for c in answer.citations
                         ],
@@ -467,6 +480,41 @@ def load_sample(filename: str) -> DocumentOut:
 
     _DOCUMENTS[document_id] = (parsed, record)
     return _to_document_out(parsed, record, has_policies=_policies_indexed())
+
+
+@app.get("/api/documents/{document_id}/pages/{page_number}")
+def page_image(document_id: str, page_number: int) -> FileResponse:
+    """Serve a rendered page image for the document previewer.
+
+    The path comes from the in-memory ``ParsedDocument`` rather than being built from the
+    URL, so a traversal attempt cannot escape the uploads directory: an unknown
+    ``document_id`` simply misses the dictionary, and an out-of-range page misses the
+    page list. No user-supplied string ever reaches the filesystem.
+    """
+    entry = _DOCUMENTS.get(document_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="That document is not loaded.")
+
+    parsed = entry[0]
+    page = next((p for p in parsed.pages if p.page_number == page_number), None)
+    if page is None or not page.image_path:
+        raise HTTPException(
+            status_code=404, detail=f"No rendered image for page {page_number}."
+        )
+
+    path = Path(page.image_path)
+    if not path.is_file():
+        raise HTTPException(
+            status_code=410,
+            detail="The page image is no longer on disk. Re-upload the document.",
+        )
+
+    return FileResponse(
+        path,
+        media_type="image/png",
+        # Immutable: a page image never changes for a given document_id.
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.delete("/api/documents/{document_id}")

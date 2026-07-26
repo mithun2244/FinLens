@@ -5,9 +5,15 @@ import { Activity, Cpu, Zap } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import { ChatPanel } from "@/components/ChatPanel";
+import { DocumentPreviewer } from "@/components/DocumentPreviewer";
 import { ExtractionDashboard } from "@/components/ExtractionDashboard";
 import { Uploader } from "@/components/Uploader";
-import type { FinancialDocument, HealthPayload, SampleDocument } from "@/lib/api";
+import type {
+  Citation,
+  FinancialDocument,
+  HealthPayload,
+  SampleDocument,
+} from "@/lib/api";
 import { fetchHealth, fetchSamples } from "@/lib/api";
 
 export default function Home() {
@@ -17,6 +23,7 @@ export default function Home() {
   const [offline, setOffline] = useState(false);
   const [tokens, setTokens] = useState(0);
   const [generateSeconds, setGenerateSeconds] = useState(0);
+  const [citation, setCitation] = useState<Citation | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -115,9 +122,24 @@ export default function Home() {
 
       {/* Three columns on wide screens; stacked below 1280px so the line-item table is
           never squeezed until the Amount column clips (decision D-31). */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 xl:grid-cols-[380px_minmax(0,1fr)_400px]">
-        <div className="min-h-0 overflow-y-auto pr-1">
-          <Uploader samples={samples} onLoaded={setDocument} disabled={offline} />
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 xl:grid-cols-[minmax(340px,0.9fr)_minmax(0,1fr)_minmax(340px,0.85fr)]">
+        <div className="flex min-h-0 flex-col gap-4 overflow-y-auto pr-1">
+          <Uploader
+            samples={samples}
+            onLoaded={(loaded) => {
+              setCitation(null);
+              setDocument(loaded);
+            }}
+            disabled={offline}
+          />
+          {/* Keyed on the document so page position resets on a new upload —
+              the same remount pattern used for ChatPanel. */}
+          <DocumentPreviewer
+            key={document?.document_id ?? "empty"}
+            document={document}
+            citation={citation}
+            onClearCitation={() => setCitation(null)}
+          />
         </div>
         <div className="min-h-0">
           <ExtractionDashboard document={document} />
@@ -129,6 +151,7 @@ export default function Home() {
             key={document?.document_id ?? "empty"}
             document={document}
             onStats={handleStats}
+            onCite={setCitation}
           />
         </div>
       </div>
