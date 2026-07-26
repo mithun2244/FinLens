@@ -18,6 +18,9 @@ interface UploaderProps {
   samples: SampleDocument[];
   onLoaded: (document: FinancialDocument) => void;
   disabled?: boolean;
+  /** Raised the moment work starts, so the shell can collapse the hero immediately
+   *  rather than waiting for the document to finish parsing. */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 const ACCEPTED = [".pdf", ".png", ".jpg", ".jpeg", ".webp"];
@@ -70,7 +73,12 @@ function TriageRing({ pct }: { pct: number }) {
   );
 }
 
-export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
+export function Uploader({
+  samples,
+  onLoaded,
+  disabled,
+  onBusyChange,
+}: UploaderProps) {
   const [status, setStatus] = useState<Status>({ phase: "idle" });
   const [pct, setPct] = useState(0);
   const [dragging, setDragging] = useState(false);
@@ -88,6 +96,7 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
       clearTimers();
       setPct(0);
       setStatus({ phase: "working", step: 0, filename });
+      onBusyChange?.(true);
 
       // The ring advances on a timer while the real work happens. It is a progress
       // *indication*, not a measurement — the backend does not stream parse progress,
@@ -114,6 +123,7 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
           seconds: (performance.now() - started) / 1000,
         });
         onLoaded(document);
+        onBusyChange?.(false);
       } catch (error) {
         clearTimers();
         setPct(0);
@@ -121,9 +131,12 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
           phase: "error",
           message: error instanceof Error ? error.message : "Upload failed.",
         });
+        // Released on failure too: a failed parse must not strand the hero collapsed
+        // with nothing behind it.
+        onBusyChange?.(false);
       }
     },
-    [clearTimers, onLoaded, pct]
+    [clearTimers, onBusyChange, onLoaded, pct]
   );
 
   const handleFiles = useCallback(

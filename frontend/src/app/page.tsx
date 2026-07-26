@@ -1,5 +1,6 @@
 "use client";
 
+import { AnimatePresence } from "motion/react";
 import { useCallback, useEffect, useState } from "react";
 
 import { ChatPanel } from "@/components/ChatPanel";
@@ -23,6 +24,12 @@ export default function Home() {
   const [tokens, setTokens] = useState(0);
   const [generateSeconds, setGenerateSeconds] = useState(0);
   const [citation, setCitation] = useState<Citation | null>(null);
+  const [parsing, setParsing] = useState(false);
+
+  // The hero is the landing state. The moment there is something to work on — a
+  // document loaded, or one being parsed — it collapses so the workspace occupies
+  // the viewport without the user having to scroll.
+  const showHero = !document && !parsing;
 
   useEffect(() => {
     let cancelled = false;
@@ -55,6 +62,14 @@ export default function Home() {
     setDocument(loaded);
   }, []);
 
+  // Collapsing the hero removes content from above the fold, so anyone who had
+  // scrolled would be left mid-page. Returning to the top keeps the workspace where
+  // the animation puts it. A scroll is a DOM side effect, which is what effects are
+  // for — unlike the setState-in-effect pattern the lint rule forbids.
+  useEffect(() => {
+    if (!showHero) window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [showHero]);
+
   return (
     <div className="relative flex min-h-screen flex-col overflow-x-auto">
       <Backdrop />
@@ -66,7 +81,7 @@ export default function Home() {
           documentName={document?.filename ?? null}
         />
 
-        <Hero />
+        <AnimatePresence initial={false}>{showHero && <Hero />}</AnimatePresence>
 
         {offline && (
           <div className="relative z-10 mx-10 mb-4 rounded-xl border-l-2 border-state-bad bg-state-bad/10 px-4 py-3 text-[12px] font-light leading-relaxed text-state-bad">
@@ -85,7 +100,12 @@ export default function Home() {
           id="workspace"
           className="relative z-10 grid min-h-[680px] grid-cols-1 xl:h-screen xl:min-w-[1180px] xl:grid-cols-[clamp(250px,19vw,320px)_minmax(430px,1fr)_clamp(330px,25vw,420px)]"
         >
-          <Uploader samples={samples} onLoaded={handleLoaded} disabled={offline} />
+          <Uploader
+            samples={samples}
+            onLoaded={handleLoaded}
+            onBusyChange={setParsing}
+            disabled={offline}
+          />
 
           <DocumentPreviewer
             key={document?.document_id ?? "empty"}

@@ -103,6 +103,15 @@ export function AppHeader({
   );
 }
 
+/**
+ * The landing hero, shown only until there is something to work on.
+ *
+ * Rendered inside an `<AnimatePresence>` by the caller: the moment a document starts
+ * parsing, this exits by collapsing its own height to zero, so the workspace rises to
+ * the top of the viewport with no scrolling required. Height is animated rather than
+ * `display: none` precisely so the transition is continuous — the panels slide up into
+ * place instead of snapping.
+ */
 export function Hero() {
   const rise = (delay: number) => ({
     opacity: 0,
@@ -110,11 +119,22 @@ export function Hero() {
   });
 
   return (
-    <section
+    <motion.section
       id="hero"
-      className="relative z-10 flex min-h-[88vh] items-end overflow-hidden"
+      // `height: auto` cannot be interpolated from a keyword, so the exit target is an
+      // explicit 0 and motion measures the start for us.
+      initial={{ height: "auto", opacity: 1 }}
+      exit={{ height: 0, opacity: 0, filter: "blur(6px)" }}
+      transition={{
+        height: { duration: 0.55, ease: [0.16, 1, 0.3, 1] },
+        opacity: { duration: 0.3, ease: "easeOut" },
+        filter: { duration: 0.3 },
+      }}
+      // No min-height on the animating element itself: a `min-h` would clamp the
+      // height and the collapse would never reach zero. It lives on the inner wrapper.
+      className="relative z-10 overflow-hidden"
     >
-      <div className="pointer-events-none w-full max-w-[900px] px-10 pb-14 pt-32">
+      <div className="pointer-events-none flex min-h-[88vh] w-full max-w-[900px] flex-col justify-end px-10 pb-14 pt-32">
         <div className="mb-[22px] flex items-center gap-2.5" style={rise(0.1)}>
           <div
             className="size-1.5 rounded-full bg-accent"
@@ -174,7 +194,7 @@ export function Hero() {
           PARSED LOCALLY · 100% TOTAL-AMOUNT ACCURACY ON THE FIXTURE SET · $0.00 TO RUN
         </p>
       </div>
-    </section>
+    </motion.section>
   );
 }
 
