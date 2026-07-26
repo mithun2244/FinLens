@@ -1,6 +1,6 @@
 "use client";
 
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { AlertTriangle, ArrowUp, BookOpen, Quote, Square } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
