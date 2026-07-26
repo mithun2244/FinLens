@@ -1,23 +1,16 @@
 "use client";
 
 import { AnimatePresence, motion } from "motion/react";
-import {
-  AlertCircle,
-  CheckCircle2,
-  FileText,
-  Image as ImageIcon,
-  Loader2,
-  UploadCloud,
-} from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 
 import type { FinancialDocument, SampleDocument } from "@/lib/api";
 import { loadSample, uploadDocument } from "@/lib/api";
-import { cn, fileExtension, formatBytes } from "@/lib/utils";
+import { cn, fileExtension } from "@/lib/utils";
+import { SectionLabel } from "@/components/Shell";
 
 type Status =
   | { phase: "idle" }
-  | { phase: "working"; label: string; filename: string }
+  | { phase: "working"; step: number; filename: string }
   | { phase: "done"; filename: string; seconds: number }
   | { phase: "error"; message: string };
 
@@ -29,41 +22,92 @@ interface UploaderProps {
 
 const ACCEPTED = [".pdf", ".png", ".jpg", ".jpeg", ".webp"];
 
-/** Parsing runs locally and takes seconds; naming the stage reads as competence where a
- *  bare spinner reads as stalling (design.md §1). These are indicative, not streamed. */
-const STAGES = [
-  "Reading the file…",
-  "Detecting page layout…",
-  "Extracting table structure…",
-  "Building the search index…",
+/** The triage pipeline, worded to match what the backend actually does.
+ *
+ *  The design's second step read "Bypassing OCR — native text found", which is exactly
+ *  our PyMuPDF triage pass (D-35): it decides in milliseconds whether a PDF has a text
+ *  layer, so a digital document never goes through OCR. */
+const STEPS = [
+  "Checking text layer",
+  "Bypassing OCR — native text found",
+  "Extracting layout & tables",
+  "Linking numeric entities",
 ];
+
+/** File-type badges from the design, mapped to what each type means for the pipeline. */
+const KINDS = [
+  { label: "PDF", note: "native text", color: "text-state-bad" },
+  { label: "MULTI", note: "tabular", color: "text-state-info" },
+  { label: "IMG", note: "needs OCR", color: "text-state-warn" },
+];
+
+function TriageRing({ pct }: { pct: number }) {
+  const circumference = 188.5;
+  return (
+    <div className="relative size-[62px] flex-none">
+      <svg viewBox="0 0 72 72" className="size-[62px] -rotate-90">
+        <circle cx="36" cy="36" r="30" fill="none" stroke="hsl(0 0% 20%)" strokeWidth="5" />
+        <circle
+          cx="36"
+          cy="36"
+          r="30"
+          fill="none"
+          stroke="hsl(119 99% 46%)"
+          strokeWidth="5"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference - (circumference * pct) / 100}
+          style={{
+            transition: "stroke-dashoffset 0.25s linear",
+            filter: "drop-shadow(0 0 5px hsl(119 99% 46% / 0.7))",
+          }}
+        />
+      </svg>
+      <div className="absolute inset-0 flex items-center justify-center font-mono text-[13px] font-medium">
+        {pct}%
+      </div>
+    </div>
+  );
+}
 
 export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
   const [status, setStatus] = useState<Status>({ phase: "idle" });
+  const [pct, setPct] = useState(0);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
-  const stageTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timers = useRef<ReturnType<typeof setInterval>[]>([]);
 
-  const stopStages = useCallback(() => {
-    if (stageTimer.current) {
-      clearInterval(stageTimer.current);
-      stageTimer.current = null;
-    }
+  const clearTimers = useCallback(() => {
+    timers.current.forEach(clearInterval);
+    timers.current = [];
   }, []);
 
   const run = useCallback(
     async (filename: string, task: () => Promise<FinancialDocument>) => {
       const started = performance.now();
-      let index = 0;
-      setStatus({ phase: "working", label: STAGES[0], filename });
-      stageTimer.current = setInterval(() => {
-        index = Math.min(index + 1, STAGES.length - 1);
-        setStatus({ phase: "working", label: STAGES[index], filename });
-      }, 1400);
+      clearTimers();
+      setPct(0);
+      setStatus({ phase: "working", step: 0, filename });
+
+      // The ring advances on a timer while the real work happens. It is a progress
+      // *indication*, not a measurement — the backend does not stream parse progress,
+      // and it is capped below 100 so it never claims completion the work has not
+      // reached.
+      timers.current.push(
+        setInterval(() => {
+          setPct((p) => Math.min(94, p + 2));
+          setStatus((s) =>
+            s.phase === "working"
+              ? { ...s, step: Math.min(STEPS.length - 1, Math.floor((pct + 2) / 25)) }
+              : s
+          );
+        }, 90)
+      );
 
       try {
         const document = await task();
-        stopStages();
+        clearTimers();
+        setPct(100);
         setStatus({
           phase: "done",
           filename,
@@ -71,14 +115,15 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
         });
         onLoaded(document);
       } catch (error) {
-        stopStages();
+        clearTimers();
+        setPct(0);
         setStatus({
           phase: "error",
           message: error instanceof Error ? error.message : "Upload failed.",
         });
       }
     },
-    [onLoaded, stopStages]
+    [clearTimers, onLoaded, pct]
   );
 
   const handleFiles = useCallback(
@@ -99,43 +144,45 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
   );
 
   const busy = status.phase === "working" || disabled;
+  const running = status.phase === "working";
 
   return (
-    <section className="flex flex-col gap-4">
-      <header className="flex items-baseline justify-between">
-        <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-ink-tertiary">
-          Document workspace
-        </h2>
-        {status.phase === "done" && (
-          <span className="tabular text-[11px] text-state-validated">
-            {status.seconds.toFixed(1)}s
+    <section
+      id="ingest"
+      style={{ animation: "fadeUp 0.7s cubic-bezier(0.16,1,0.3,1) 0.1s backwards" }}
+      className="flex min-h-0 flex-col gap-[18px] overflow-y-auto border-r border-edge-hair bg-surface-panel/[0.66] px-[18px] pb-7 pt-6 backdrop-blur-xl"
+    >
+      <SectionLabel
+        index="01"
+        title="Ingest"
+        right={
+          <span className="font-mono text-[9.5px] text-accent">
+            {samples.length + (status.phase === "done" ? 1 : 0)} FILES
           </span>
-        )}
-      </header>
+        }
+      />
 
-      <motion.div
-        onDragOver={(event) => {
-          event.preventDefault();
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
           if (!busy) setDragging(true);
         }}
         onDragLeave={() => setDragging(false)}
-        onDrop={(event) => {
-          event.preventDefault();
+        onDrop={(e) => {
+          e.preventDefault();
           setDragging(false);
-          if (!busy) handleFiles(event.dataTransfer.files);
+          if (!busy) handleFiles(e.dataTransfer.files);
         }}
         onClick={() => !busy && inputRef.current?.click()}
-        animate={{
-          scale: dragging ? 1.015 : 1,
-          borderColor: dragging ? "var(--color-brand-500)" : "var(--color-edge-default)",
-          backgroundColor: dragging
-            ? "rgba(42,167,154,0.07)"
-            : "var(--color-surface-raised)",
+        style={{
+          borderColor: dragging ? "hsl(119 99% 46%)" : "hsl(0 0% 22%)",
+          background: dragging ? "hsl(119 99% 46% / 0.07)" : "hsl(0 0% 11%)",
+          transform: `scale(${dragging ? 1.025 : 1})`,
+          transition:
+            "transform 0.35s cubic-bezier(0.16,1,0.3,1), background 0.3s, border-color 0.3s",
         }}
-        whileHover={busy ? undefined : { borderColor: "var(--color-edge-strong)" }}
-        transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
         className={cn(
-          "relative cursor-pointer rounded-2xl border-2 border-dashed p-8 text-center",
+          "flex cursor-pointer flex-col items-center gap-3 rounded-[14px] border-[1.5px] border-dashed px-4 py-[26px] text-center",
           busy && "cursor-wait opacity-80"
         )}
       >
@@ -144,74 +191,104 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
           type="file"
           accept={ACCEPTED.join(",")}
           className="hidden"
-          onChange={(event) => handleFiles(event.target.files)}
+          onChange={(e) => handleFiles(e.target.files)}
         />
+        <div
+          className="flex size-11 items-center justify-center rounded-xl border border-edge-default bg-surface-lifted"
+          style={{ animation: dragging ? "pulseRing 1.1s ease-in-out infinite" : "none" }}
+        >
+          <div
+            className="size-[15px] rotate-45 rounded border-2 border-accent"
+            style={{ borderBottomColor: "transparent", borderRightColor: "transparent" }}
+          />
+        </div>
+        <div>
+          <div className="mb-1 text-[13px] font-medium">
+            {dragging ? "Release to ingest" : "Drop financial documents"}
+          </div>
+          <div className="font-mono text-[9.5px] tracking-[0.1em] text-ink-muted">
+            PDF · STATEMENT · SCANNED RECEIPT · PNG
+          </div>
+        </div>
+        <span className="rounded bg-accent px-[15px] py-[7px] text-[11px] font-semibold uppercase tracking-[0.1em] text-accent-ink transition-[filter] hover:brightness-110">
+          Browse files
+        </span>
+      </div>
 
-        <AnimatePresence mode="wait">
-          {status.phase === "working" ? (
-            <motion.div
-              key="working"
-              initial={{ opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              className="flex flex-col items-center gap-3"
+      <div className="flex gap-[7px]">
+        {KINDS.map((k) => (
+          <div
+            key={k.label}
+            className="flex-1 rounded-lg border border-edge-subtle bg-surface-raised px-1.5 py-2 text-center"
+          >
+            <div className={cn("font-mono text-[10px] font-medium", k.color)}>{k.label}</div>
+            <div className="mt-0.5 text-[9px] text-ink-faint">{k.note}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex flex-col gap-3.5 rounded-[14px] border border-edge-subtle bg-surface-raised/70 px-3.5 py-[15px] backdrop-blur-md">
+        <div className="flex items-center gap-3.5">
+          <TriageRing pct={pct} />
+          <div className="min-w-0">
+            <div className="mb-[5px] font-mono text-[9px] tracking-[0.2em] text-ink-faint">
+              TRIAGE PIPELINE
+            </div>
+            <div
+              className={cn(
+                "text-[12px] font-medium leading-[1.35]",
+                running ? "text-ink-primary" : "text-accent"
+              )}
             >
-              <Loader2 className="size-7 animate-spin text-brand-500" />
-              <p className="text-sm font-medium text-ink-primary">{status.filename}</p>
-              <motion.p
-                key={status.label}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="tabular text-xs text-ink-tertiary"
-              >
-                {status.label}
-              </motion.p>
-            </motion.div>
-          ) : (
-            <motion.div
-              key="idle"
-              initial={{ opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              className="flex flex-col items-center gap-3"
-            >
-              <motion.div
-                animate={{ y: dragging ? -4 : 0 }}
-                transition={{ type: "spring", stiffness: 300, damping: 20 }}
-              >
-                <UploadCloud
-                  className={cn(
-                    "size-9 transition-colors",
-                    dragging ? "text-brand-500" : "text-ink-tertiary"
-                  )}
-                />
-              </motion.div>
-              <p className="text-sm font-semibold text-ink-primary">
-                Drop a financial document here
-              </p>
-              <p className="text-xs leading-relaxed text-ink-tertiary">
-                PDF, PNG, JPG · up to 25 MB
-                <br />
-                Parsed{" "}
-                <span className="font-medium text-ink-secondary">
-                  locally on your machine
-                </span>{" "}
-                — the document never leaves it
-              </p>
-              <div className="mt-1 flex flex-wrap justify-center gap-1.5">
-                {ACCEPTED.map((extension) => (
-                  <span
-                    key={extension}
-                    className="rounded-full border border-edge-subtle bg-surface-sunken px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink-tertiary"
-                  >
-                    {extension.slice(1)}
-                  </span>
-                ))}
+              {running
+                ? STEPS[status.step]
+                : status.phase === "done"
+                  ? `Triage complete · ${status.seconds.toFixed(1)}s`
+                  : "Awaiting a document"}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-[9px]">
+          {STEPS.map((label, i) => {
+            const done = status.phase === "done" || (running && i < status.step);
+            const active = running && i === status.step;
+            return (
+              <div key={label} className="flex items-center gap-[9px]">
+                <div
+                  className="flex size-3.5 flex-none items-center justify-center rounded border font-mono text-[8px] font-semibold text-accent-ink transition-all"
+                  style={{
+                    borderColor: done
+                      ? "hsl(119 99% 46%)"
+                      : active
+                        ? "hsl(119 99% 46% / 0.6)"
+                        : "hsl(0 0% 26%)",
+                    background: done
+                      ? "hsl(119 99% 46%)"
+                      : active
+                        ? "hsl(119 99% 46% / 0.22)"
+                        : "transparent",
+                  }}
+                >
+                  {done ? "✓" : ""}
+                </div>
+                <span
+                  className="text-[11.5px] font-light transition-colors"
+                  style={{
+                    color: done
+                      ? "hsl(0 0% 84%)"
+                      : active
+                        ? "hsl(0 0% 96%)"
+                        : "hsl(0 0% 42%)",
+                  }}
+                >
+                  {label}
+                </span>
               </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
+            );
+          })}
+        </div>
+      </div>
 
       <AnimatePresence>
         {status.phase === "error" && (
@@ -219,69 +296,68 @@ export function Uploader({ samples, onLoaded, disabled }: UploaderProps) {
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: "auto" }}
             exit={{ opacity: 0, height: 0 }}
-            className="flex items-start gap-2 rounded-lg border-l-2 border-state-error bg-state-error/10 px-3 py-2.5"
+            className="rounded-lg border-l-2 border-state-bad bg-state-bad/10 px-3 py-2.5 text-[11px] leading-relaxed text-state-bad"
           >
-            <AlertCircle className="mt-0.5 size-4 shrink-0 text-state-error" />
-            <p className="text-xs leading-relaxed text-state-error">{status.message}</p>
-          </motion.div>
-        )}
-        {status.phase === "done" && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            exit={{ opacity: 0, height: 0 }}
-            className="flex items-center gap-2 rounded-lg border-l-2 border-state-validated bg-state-validated/10 px-3 py-2.5"
-          >
-            <CheckCircle2 className="size-4 shrink-0 text-state-validated" />
-            <p className="text-xs text-state-validated">
-              {status.filename} parsed and indexed
-            </p>
+            {status.message}
           </motion.div>
         )}
       </AnimatePresence>
 
-      {samples.length > 0 && (
-        <div className="flex flex-col gap-2">
-          <p className="text-[11px] text-ink-tertiary">Or try a sample:</p>
-          <div className="grid grid-cols-2 gap-2">
-            {samples.map((sample, index) => {
-              const isImage = /\.(png|jpe?g|webp)$/i.test(sample.filename);
-              return (
-                <motion.button
-                  key={sample.filename}
-                  type="button"
-                  disabled={busy}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.04 * index, duration: 0.25 }}
-                  whileHover={busy ? undefined : { y: -2 }}
-                  whileTap={busy ? undefined : { scale: 0.98 }}
-                  onClick={() =>
-                    void run(sample.filename, () => loadSample(sample.filename))
-                  }
-                  className={cn(
-                    "flex items-center gap-2 rounded-xl border border-edge-subtle bg-surface-raised px-3 py-2.5 text-left",
-                    "transition-colors hover:border-brand-500/60 hover:bg-surface-hover",
-                    "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500",
-                    busy && "cursor-not-allowed opacity-50"
-                  )}
+      <SectionLabel index="Q" title="Queue" />
+
+      <div className="flex flex-col gap-2">
+        {samples.map((sample, index) => {
+          const active = status.phase === "done" && status.filename === sample.filename;
+          const isImage = /\.(png|jpe?g|webp)$/i.test(sample.filename);
+          const kind = isImage ? "IMG" : sample.filename.includes("statement") ? "MULTI" : "PDF";
+          const kindColor = isImage
+            ? "hsl(38 92% 60%)"
+            : kind === "MULTI"
+              ? "hsl(199 80% 62%)"
+              : "hsl(0 84% 66%)";
+          return (
+            <motion.button
+              key={sample.filename}
+              type="button"
+              disabled={busy}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.04 * index }}
+              onClick={() => void run(sample.filename, () => loadSample(sample.filename))}
+              style={{
+                borderColor: active ? "hsl(119 99% 46% / 0.45)" : "hsl(0 0% 18%)",
+                background: active ? "hsl(119 99% 46% / 0.05)" : "hsl(0 0% 12%)",
+                boxShadow: active ? "0 0 22px -8px hsl(119 99% 46% / 0.7)" : "none",
+              }}
+              className="flex cursor-pointer items-center gap-[11px] rounded-[11px] border px-3 py-[11px] text-left transition-all disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <div
+                className="flex h-[34px] w-[30px] flex-none items-end justify-center rounded border bg-surface-raised pb-1"
+                style={{ borderColor: kindColor }}
+              >
+                <span
+                  className="font-mono text-[7.5px] tracking-[0.06em]"
+                  style={{ color: kindColor }}
                 >
-                  {isImage ? (
-                    <ImageIcon className="size-4 shrink-0 text-ink-tertiary" />
-                  ) : (
-                    <FileText className="size-4 shrink-0 text-ink-tertiary" />
-                  )}
-                  <span className="truncate text-xs text-ink-secondary">
-                    {sample.label}
-                  </span>
-                </motion.button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+                  {kind}
+                </span>
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[11.5px] font-medium">{sample.label}</div>
+                <div className="mt-[3px] truncate font-mono text-[9px] text-ink-faint">
+                  {sample.filename}
+                </div>
+              </div>
+              <span
+                className="whitespace-nowrap font-mono text-[8.5px] tracking-[0.1em]"
+                style={{ color: active ? "hsl(119 99% 46%)" : "hsl(0 0% 50%)" }}
+              >
+                {active ? "ACTIVE" : "READY"}
+              </span>
+            </motion.button>
+          );
+        })}
+      </div>
     </section>
   );
 }
-
-export { formatBytes };

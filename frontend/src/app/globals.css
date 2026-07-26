@@ -1,68 +1,174 @@
 @import "tailwindcss";
 
-/* FinLens design tokens (design.md §3), dark-mode first.
-   Tailwind v4 is CSS-first: these @theme entries generate the utility classes, so
-   components reference `bg-surface-raised` rather than a hardcoded hex. */
+/* FinLens design system, imported from the claude.ai/design project
+   "FinLens Financial Dashboard" (FinLens.dc.html).
+
+   Tailwind v4 is CSS-first, so the source's raw HSL values become @theme entries and
+   components reference `bg-surface-raised` rather than a literal colour. */
 @theme {
-  --color-surface-base: #0f1115;
-  --color-surface-raised: #171a21;
-  --color-surface-sunken: #0b0d11;
-  --color-surface-hover: #1d212a;
+  --color-surface-base: hsl(0 0% 8%);
+  --color-surface-panel: hsl(0 0% 9%);
+  --color-surface-raised: hsl(0 0% 12%);
+  --color-surface-lifted: hsl(0 0% 14%);
+  --color-surface-hover: hsl(0 0% 20%);
 
-  --color-ink-primary: #eceef3;
-  --color-ink-secondary: #a0a7b6;
-  --color-ink-tertiary: #6b7280;
+  --color-ink-primary: hsl(0 0% 96%);
+  --color-ink-secondary: hsl(0 0% 66%);
+  --color-ink-muted: hsl(0 0% 50%);
+  --color-ink-faint: hsl(0 0% 44%);
 
-  --color-edge-subtle: #232833;
-  --color-edge-default: #2e3543;
-  --color-edge-strong: #3d4655;
+  --color-edge-hair: hsl(0 0% 100% / 0.07);
+  --color-edge-subtle: hsl(0 0% 18%);
+  --color-edge-default: hsl(0 0% 22%);
+  --color-edge-strong: hsl(0 0% 32%);
 
-  --color-brand-500: #2aa79a;
-  --color-brand-600: #0f766e;
-  --color-brand-glow: #14867c;
+  /* The accent. One colour, used for the active path and nothing decorative. */
+  --color-accent: hsl(119 99% 46%);
+  --color-accent-bright: hsl(119 99% 62%);
+  --color-accent-ink: hsl(0 0% 4%);
 
-  /* Semantic colours carry meaning, never decoration. Each is paired with an icon and
-     a text label in the components — a table of numbers must not encode state by
-     colour alone (design.md §7). */
-  --color-state-validated: #3dbf85;
-  --color-state-warning: #e3a008;
-  --color-state-error: #f0645b;
-  --color-state-info: #6699ff;
+  /* Semantic, and mapped to the confidence bands the backend already computes:
+     >=90 accent, >=80 amber, <80 red. Each is paired with a text label in the
+     components — never colour alone. */
+  --color-state-ok: hsl(119 99% 56%);
+  --color-state-warn: hsl(38 92% 60%);
+  --color-state-bad: hsl(0 84% 66%);
+  --color-state-info: hsl(199 80% 62%);
 
-  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --font-display: var(--font-sora), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, monospace;
 }
 
 html {
+  scroll-behavior: smooth;
   background: var(--color-surface-base);
   color-scheme: dark;
 }
 
 body {
+  margin: 0;
   background: var(--color-surface-base);
   color: var(--color-ink-primary);
+  font-family: var(--font-display);
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Every amount in this product is monospace with tabular figures so columns align on
-   the decimal point. Proportional digits in a financial table are a correctness
-   problem, not a taste one (design.md §3.2). */
+/* Micro-label: uppercase mono with wide tracking. The design uses it for every
+   section marker ("01 / INGEST") and metadata line. */
+.micro {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+}
+
+/* Every amount is monospace with tabular figures so columns align on the decimal
+   point. Proportional digits in a financial table are a correctness problem. */
 .tabular {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
 
+@keyframes fadeUp {
+  0% {
+    opacity: 0;
+    transform: translateY(20px);
+    filter: blur(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes pulseRing {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 hsl(119 99% 46% / 0.35),
+      0 0 24px -6px hsl(119 99% 46% / 0.4);
+  }
+  50% {
+    box-shadow:
+      0 0 0 10px hsl(119 99% 46% / 0),
+      0 0 42px -4px hsl(119 99% 46% / 0.6);
+  }
+}
+@keyframes shimmer {
+  0% {
+    background-position: -220% 0;
+  }
+  100% {
+    background-position: 220% 0;
+  }
+}
+@keyframes blink {
+  0%,
+  60% {
+    opacity: 1;
+  }
+  61%,
+  100% {
+    opacity: 0.15;
+  }
+}
+@keyframes boxIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Stands in for the design's background video.
+   The source references uploads/Flowing_gradients_…mp4, which is past the 256 KiB
+   cap on design-file reads and so could not be imported. This reproduces the intent —
+   slow flowing gradients behind a dark scrim — in CSS, at no download cost. */
+@keyframes drift {
+  0% {
+    transform: translate3d(-4%, -2%, 0) scale(1.1);
+  }
+  50% {
+    transform: translate3d(4%, 3%, 0) scale(1.18);
+  }
+  100% {
+    transform: translate3d(-4%, -2%, 0) scale(1.1);
+  }
+}
+.backdrop-flow {
+  background:
+    radial-gradient(50% 55% at 18% 22%, hsl(119 99% 46% / 0.16), transparent 60%),
+    radial-gradient(45% 50% at 82% 30%, hsl(199 80% 62% / 0.12), transparent 62%),
+    radial-gradient(60% 60% at 50% 88%, hsl(119 99% 46% / 0.1), transparent 65%);
+  animation: drift 34s ease-in-out infinite;
+  will-change: transform;
+}
+
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-edge-default);
-  border-radius: 999px;
+  background: hsl(0 0% 24%);
+  border-radius: 99px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-edge-strong);
+  background: hsl(0 0% 34%);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -70,6 +176,8 @@ body {
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

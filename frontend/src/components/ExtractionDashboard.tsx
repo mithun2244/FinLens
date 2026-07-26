@@ -1,293 +1,298 @@
 "use client";
 
 import { AnimatePresence, motion } from "motion/react";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  FileWarning,
-  Info,
-  ScanLine,
-} from "lucide-react";
 
-import type { FinancialDocument, ValidationState } from "@/lib/api";
+import type { Citation, FinancialDocument, ValidationState } from "@/lib/api";
 import { cn, formatAmount, formatPercent } from "@/lib/utils";
+import { SectionLabel } from "@/components/Shell";
 
 interface ExtractionDashboardProps {
   document: FinancialDocument | null;
+  loading?: boolean;
+  /** Clicking a field focuses its source page in the viewer. */
+  onFocus?: (citation: Citation) => void;
 }
 
-const BANNER: Record<
-  ValidationState,
-  { icon: typeof CheckCircle2; tone: string; title: string }
-> = {
+const BANNER: Record<ValidationState, { tone: string; mark: string; title: string }> = {
   validated: {
-    icon: CheckCircle2,
-    tone: "border-state-validated bg-state-validated/10 text-state-validated",
+    tone: "border-accent bg-accent/[0.07] text-accent",
+    mark: "✓",
     title: "Validated",
   },
   mismatch: {
-    icon: AlertTriangle,
-    tone: "border-state-warning bg-state-warning/10 text-state-warning",
+    tone: "border-state-warn bg-state-warn/10 text-state-warn",
+    mark: "!",
     title: "Mismatch",
   },
   incomplete: {
-    icon: FileWarning,
-    tone: "border-state-warning bg-state-warning/10 text-state-warning",
+    tone: "border-state-warn bg-state-warn/10 text-state-warn",
+    mark: "?",
     title: "Incomplete",
   },
 };
 
-/** Confidence is fill AND colour, never colour alone (design.md §7). */
-function ConfidenceDot({ band, title }: { band: string; title: string }) {
-  return (
-    <span
-      title={title}
-      className={cn(
-        "inline-block size-2 rounded-full",
-        band === "high" && "bg-state-validated",
-        band === "medium" && "border-[1.5px] border-state-warning",
-        band === "low" && "border-[1.5px] border-state-error"
-      )}
-    />
-  );
+/** The design's confidence bands: >=90 accent, >=80 amber, <80 red. */
+function bandStyle(band: string) {
+  if (band === "high")
+    return {
+      fg: "hsl(119 99% 56%)",
+      bg: "hsl(119 99% 46% / 0.1)",
+      border: "hsl(119 99% 46% / 0.35)",
+    };
+  if (band === "medium")
+    return {
+      fg: "hsl(38 92% 62%)",
+      bg: "hsl(38 92% 60% / 0.1)",
+      border: "hsl(38 92% 60% / 0.35)",
+    };
+  return {
+    fg: "hsl(0 84% 66%)",
+    bg: "hsl(0 84% 60% / 0.12)",
+    border: "hsl(0 84% 60% / 0.4)",
+  };
 }
 
-function bannerBody(document: FinancialDocument): string {
-  const { currency } = document;
-  if (document.validation_state === "validated") {
-    return `Line items + tax = ${formatAmount(document.total_amount)} ${currency}, matching the stated total.`;
-  }
-  if (document.validation_state === "mismatch") {
-    const stated = Number(document.total_amount ?? 0);
-    const computed = Number(document.computed_total);
-    const difference = Math.abs(stated - computed).toFixed(2);
-    return `Line items + tax = ${formatAmount(document.computed_total)}, but the document states ${formatAmount(document.total_amount)} (difference ${formatAmount(difference)}). Review the rows below.`;
-  }
-  return "The total could not be read from this document. Nothing has been assumed in its place.";
+interface FieldRow {
+  label: string;
+  value: string;
+  page: number;
+  /** Only set where the backend actually computed a confidence. */
+  band?: string;
+  confidence?: number;
+  low?: boolean;
 }
 
-export function ExtractionDashboard({ document }: ExtractionDashboardProps) {
+function buildFields(document: FinancialDocument): FieldRow[] {
+  const rows: FieldRow[] = [
+    { label: "VENDOR NAME", value: document.vendor_name, page: 1 },
+    {
+      label: "DOCUMENT DATE",
+      value:
+        document.billing_period_start && document.billing_period_end
+          ? `${document.billing_period_start} → ${document.billing_period_end}`
+          : (document.billing_date ?? "—"),
+      page: 1,
+    },
+  ];
+
+  if (document.invoice_number) {
+    rows.push({ label: "REFERENCE", value: document.invoice_number, page: 1 });
+  }
+
+  // Line items are the only extracted values carrying a real confidence score, so the
+  // weakest row sets the badge. Inventing a percentage for vendor or dates would be
+  // precision this system never computed.
+  if (document.line_items.length > 0) {
+    const weakest = document.line_items.reduce((worst, item) =>
+      item.confidence < worst.confidence ? item : worst
+    );
+    rows.push({
+      label: "LINE ITEMS",
+      value: `${document.line_items.length} rows · ${formatAmount(document.subtotal)} ${document.currency}`,
+      page: weakest.source_page,
+      band: weakest.confidence_band,
+      confidence: weakest.confidence,
+      low: weakest.confidence_band === "low",
+    });
+  }
+
+  for (const tax of document.tax_lines) {
+    const rate = formatPercent(tax.rate);
+    rows.push({
+      label: `TAX · ${tax.label.toUpperCase()}${rate ? ` ${rate}%` : ""}`,
+      value: `${formatAmount(tax.amount)} ${document.currency}`,
+      page: 1,
+    });
+  }
+
+  rows.push({
+    label: "TOTAL AMOUNT",
+    value: `${formatAmount(document.total_amount)} ${document.currency}`,
+    page: document.page_count,
+  });
+
+  return rows;
+}
+
+function focusFor(document: FinancialDocument, row: FieldRow): Citation {
+  return {
+    document_id: document.document_id,
+    filename: document.filename,
+    page: row.page,
+    label: `${row.label} · p${row.page}`,
+    snippet: `${row.label}: ${row.value}`,
+    score: 1,
+    chunk_type: "field",
+    // No bounding box: these come from the structured record, not from retrieval.
+    // The viewer marks the page rather than claiming a region it does not know.
+    bbox: null,
+  };
+}
+
+export function ExtractionDashboard({
+  document,
+  loading,
+  onFocus,
+}: ExtractionDashboardProps) {
   return (
-    <section className="flex min-h-0 flex-col gap-4">
-      <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-ink-tertiary">
-        Extraction dashboard
-      </h2>
+    <div
+      id="extract"
+      style={{ animation: "fadeUp 0.7s cubic-bezier(0.16,1,0.3,1) 0.2s backwards" }}
+      className="flex flex-none flex-col gap-3.5 border-b border-edge-subtle px-[18px] pb-4 pt-[18px]"
+    >
+      <SectionLabel
+        index="02"
+        title="Extracted fields"
+        right={
+          <span
+            className="font-mono text-[9.5px]"
+            style={{ color: loading ? "hsl(0 0% 50%)" : "hsl(119 99% 46%)" }}
+          >
+            {loading
+              ? "PARSING…"
+              : document
+                ? `${document.line_items.length} ROWS · ${document.used_ocr ? "OCR" : "TEXT LAYER"}`
+                : "IDLE"}
+          </span>
+        }
+      />
 
       <AnimatePresence mode="wait">
-        {!document ? (
+        {loading ? (
           <motion.div
+            key="skeleton"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="flex flex-col gap-[9px]"
+          >
+            {[100, 100, 88, 94, 76].map((w, i) => (
+              <div
+                key={i}
+                style={{
+                  height: 40,
+                  width: `${w}%`,
+                  background:
+                    "linear-gradient(90deg, hsl(0 0% 15%) 25%, hsl(0 0% 22%) 50%, hsl(0 0% 15%) 75%)",
+                  backgroundSize: "220% 100%",
+                  animation: "shimmer 1.4s linear infinite",
+                }}
+                className="rounded-md"
+              />
+            ))}
+          </motion.div>
+        ) : !document ? (
+          <motion.p
             key="empty"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="rounded-2xl border border-edge-subtle bg-surface-raised p-6"
+            className="text-[11.5px] font-light leading-relaxed text-ink-faint"
           >
-            <p className="text-xs leading-relaxed text-ink-tertiary">
-              Upload a document to see its extracted vendor, line items, and totals.
-            </p>
-          </motion.div>
+            Drop a document to see its vendor, line items and totals extracted here.
+          </motion.p>
         ) : (
           <motion.div
             key={document.document_id}
-            initial={{ opacity: 0, y: 10 }}
+            initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-            className="flex min-h-0 flex-col gap-3 overflow-y-auto pr-1"
+            exit={{ opacity: 0 }}
+            className="flex flex-col gap-2.5"
           >
-            {/* Vendor */}
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.03 }}
-              className="rounded-2xl border border-edge-subtle bg-surface-raised p-4"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <h3 className="truncate text-lg font-semibold text-ink-primary">
-                    {document.vendor_name}
-                  </h3>
-                  <p className="mt-1 text-xs text-ink-tertiary">
-                    {[
-                      document.invoice_number && `#${document.invoice_number}`,
-                      document.billing_period_start && document.billing_period_end
-                        ? `${document.billing_period_start} → ${document.billing_period_end}`
-                        : document.billing_date,
-                      `${document.page_count} page${document.page_count === 1 ? "" : "s"}`,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </p>
-                </div>
-                <span className="shrink-0 rounded-full bg-brand-600/20 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-brand-500">
-                  {document.document_type.replace("_", " ")}
-                </span>
-              </div>
-              {document.used_ocr && (
-                <div className="mt-3 flex items-center gap-1.5 text-[11px] text-ink-tertiary">
-                  <ScanLine className="size-3.5" />
-                  Read with local OCR — no text layer found
-                </div>
-              )}
-            </motion.div>
-
-            {/* Validation banner — arithmetic only. An advisory note must never turn a
-                document whose maths is correct into a red mismatch (decision D-19). */}
+            {/* Arithmetic only. An advisory note must never turn a document whose maths
+                is correct into a red mismatch (decision D-19). */}
             {(() => {
-              const config = BANNER[document.validation_state];
-              const Icon = config.icon;
+              const banner = BANNER[document.validation_state];
+              const difference =
+                document.validation_state === "mismatch"
+                  ? Math.abs(
+                      Number(document.total_amount ?? 0) - Number(document.computed_total)
+                    ).toFixed(2)
+                  : null;
               return (
-                <motion.div
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.06 }}
+                <div
                   className={cn(
-                    "flex items-start gap-2.5 rounded-xl border-l-2 px-3.5 py-3",
-                    config.tone
+                    "flex items-start gap-2.5 rounded-[10px] border-l-2 px-3 py-2.5",
+                    banner.tone
                   )}
                 >
-                  <Icon className="mt-0.5 size-4 shrink-0" />
-                  <p className="text-xs leading-relaxed">
-                    <span className="font-semibold">{config.title}.</span>{" "}
-                    {bannerBody(document)}
+                  <span className="font-mono text-[11px] font-semibold">{banner.mark}</span>
+                  <p className="text-[11px] font-light leading-relaxed">
+                    <span className="font-medium">{banner.title}.</span>{" "}
+                    {document.validation_state === "validated"
+                      ? `Line items + tax = ${formatAmount(document.total_amount)} ${document.currency}, matching the stated total.`
+                      : document.validation_state === "mismatch"
+                        ? `Line items + tax = ${formatAmount(document.computed_total)}, but the document states ${formatAmount(document.total_amount)} (difference ${formatAmount(difference)}).`
+                        : "The total could not be read. Nothing has been assumed in its place."}
                   </p>
-                </motion.div>
+                </div>
               );
             })()}
 
             {document.extraction_warnings.length > 0 && (
-              <motion.div
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: 0.09 }}
-                className="flex items-start gap-2.5 rounded-xl border-l-2 border-state-info bg-state-info/10 px-3.5 py-3"
-              >
-                <Info className="mt-0.5 size-4 shrink-0 text-state-info" />
-                <div className="text-xs leading-relaxed text-state-info">
-                  <p className="font-semibold">Notes</p>
-                  <ul className="mt-1 list-disc space-y-1 pl-4">
-                    {document.extraction_warnings.map((warning) => (
-                      <li key={warning}>{warning}</li>
-                    ))}
-                  </ul>
-                </div>
-              </motion.div>
+              <div className="rounded-[10px] border-l-2 border-state-info bg-state-info/10 px-3 py-2.5">
+                <p className="font-mono text-[8.5px] tracking-[0.16em] text-state-info">
+                  NOTES
+                </p>
+                <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] font-light leading-relaxed text-state-info">
+                  {document.extraction_warnings.map((w) => (
+                    <li key={w}>{w}</li>
+                  ))}
+                </ul>
+              </div>
             )}
 
-            {/* Line items */}
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.12 }}
-              className="overflow-hidden rounded-2xl border border-edge-subtle bg-surface-raised"
-            >
-              {document.line_items.length === 0 ? (
-                <p className="p-4 text-xs leading-relaxed text-ink-tertiary">
-                  No line items detected. This may be a summary document — try asking a
-                  question about it directly.
-                </p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="border-b border-edge-default">
-                        <th className="px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-ink-tertiary">
-                          Description
-                        </th>
-                        <th className="px-2 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-tertiary">
-                          Qty
-                        </th>
-                        <th className="px-2 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-tertiary">
-                          Unit
-                        </th>
-                        <th className="px-3 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-ink-tertiary">
-                          Amount
-                        </th>
-                        <th className="px-2 py-2.5" />
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {document.line_items.map((item, index) => (
-                        <motion.tr
-                          key={`${item.description}-${index}`}
-                          initial={{ opacity: 0, x: -6 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: 0.14 + index * 0.04 }}
-                          className="border-b border-edge-subtle last:border-0 hover:bg-surface-hover"
-                        >
-                          <td className="max-w-[220px] px-3 py-2.5 text-ink-primary">
-                            {item.description}
-                          </td>
-                          <td className="tabular px-2 py-2.5 text-right text-ink-secondary">
-                            {item.quantity ?? "—"}
-                          </td>
-                          <td className="tabular px-2 py-2.5 text-right text-ink-secondary">
-                            {item.unit_price ?? "—"}
-                          </td>
-                          <td className="tabular px-3 py-2.5 text-right font-medium text-ink-primary">
-                            {formatAmount(item.amount)}
-                          </td>
-                          <td className="px-2 py-2.5 text-center">
-                            <ConfidenceDot
-                              band={item.confidence_band}
-                              title={`confidence ${Math.round(item.confidence * 100)}%, page ${item.source_page}`}
-                            />
-                          </td>
-                        </motion.tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </motion.div>
-
-            {/* Totals */}
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.18 }}
-              className="rounded-2xl bg-surface-sunken p-4"
-            >
-              <div className="flex items-baseline justify-between py-1 text-xs text-ink-secondary">
-                <span>Subtotal</span>
-                <span className="tabular text-ink-primary">
-                  {formatAmount(document.subtotal)}
-                </span>
-              </div>
-              {document.tax_lines.map((tax) => {
-                const rate = formatPercent(tax.rate);
+            <div className="flex flex-col gap-1.5">
+              {buildFields(document).map((row, i) => {
+                const style = row.band ? bandStyle(row.band) : null;
                 return (
-                  <div
-                    key={`${tax.label}-${tax.amount}`}
-                    className="flex items-baseline justify-between py-1 text-xs text-ink-secondary"
+                  <motion.button
+                    key={`${row.label}-${i}`}
+                    type="button"
+                    initial={{ opacity: 0, x: -5 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: 0.03 * i }}
+                    onClick={() => onFocus?.(focusFor(document, row))}
+                    style={{
+                      borderColor: row.low ? "hsl(0 84% 60% / 0.3)" : "hsl(0 0% 18%)",
+                      background: row.low ? "hsl(0 84% 60% / 0.05)" : "hsl(0 0% 12%)",
+                    }}
+                    className="flex cursor-pointer items-center gap-2.5 rounded-[10px] border px-[11px] py-[9px] text-left transition-all hover:border-accent/50"
                   >
-                    <span>
-                      {tax.label}
-                      {rate ? ` (${rate}%)` : ""}
+                    <div className="min-w-0 flex-1">
+                      <div className="font-mono text-[8.5px] tracking-[0.16em] text-ink-muted">
+                        {row.label}
+                      </div>
+                      <div className="tabular mt-[3px] truncate text-[12px] font-medium">
+                        {row.value}
+                      </div>
+                    </div>
+                    <span
+                      className="whitespace-nowrap rounded-full border px-[7px] py-[3px] font-mono text-[8.5px] tracking-[0.08em]"
+                      style={
+                        style
+                          ? { color: style.fg, background: style.bg, borderColor: style.border }
+                          : {
+                              color: "hsl(0 0% 56%)",
+                              background: "hsl(0 0% 16%)",
+                              borderColor: "hsl(0 0% 24%)",
+                            }
+                      }
+                    >
+                      {/* A percentage only where one was actually computed. */}
+                      {row.confidence !== undefined
+                        ? row.low
+                          ? `REVIEW ${Math.round(row.confidence * 100)}%`
+                          : `${Math.round(row.confidence * 100)}%`
+                        : "VIEW"}
                     </span>
-                    <span className="tabular text-ink-primary">
-                      {formatAmount(tax.amount)}
-                    </span>
-                  </div>
+                  </motion.button>
                 );
               })}
-              <div className="mt-2 flex items-baseline justify-between border-t border-edge-default pt-3">
-                <span className="text-sm font-semibold text-ink-primary">TOTAL</span>
-                <motion.span
-                  key={document.total_amount ?? "none"}
-                  initial={{ opacity: 0, scale: 0.96 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ delay: 0.22, type: "spring", stiffness: 260, damping: 20 }}
-                  className="tabular text-base font-semibold text-ink-primary"
-                >
-                  {formatAmount(document.total_amount)}{" "}
-                  <span className="text-xs text-ink-tertiary">{document.currency}</span>
-                </motion.span>
-              </div>
-            </motion.div>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
-    </section>
+    </div>
   );
 }
