@@ -497,13 +497,30 @@ def grounding_summary(results: list[ItemResult]) -> dict[str, Any]:
     contradicting = [r for r in answered if r.answer and r.answer.contradicting_figures]
     invented_cites = [r for r in answered if r.answer and r.answer.dropped_citations]
 
-    def rate(subset: list[ItemResult], total: list[ItemResult]) -> float:
-        return len(subset) / len(total) if total else 0.0
+    def rate(subset: list[ItemResult], total: list[ItemResult]) -> float | None:
+        """The share of ``total`` in ``subset``, or ``None`` when nothing was measured.
+
+        ``None`` rather than ``0.0``, because the two mean opposite things and only one
+        of them is good news. A run where every question errored divided by an empty set
+        and reported 0% unsupported figures, 0% contradictions and a 100% citation rate —
+        a flawless scorecard for a run that answered nothing. That is how the q16
+        unsupported-figure bug stayed invisible across two runs: both were read as passes.
+
+        The denominators differ per metric, so this is not only about wholly empty runs.
+        A ``--kinds refusal`` run answers plenty while leaving ``non_refusal`` empty, and
+        used to report a perfect citation rate over zero applicable answers.
+        """
+        return len(subset) / len(total) if total else None
+
+    citation_rate = None if not non_refusal else 1.0 - (len(uncited) / len(non_refusal))
 
     return {
         "answered": len(answered),
         "errored": len(results) - len(answered),
-        "citation_rate": 1.0 - rate(uncited, non_refusal),
+        #: Denominators, so a reader can tell "0 of 0" from "0 of 24" at a glance.
+        "non_refusal_answered": len(non_refusal),
+        "refusal_answered": len(refusal_items),
+        "citation_rate": citation_rate,
         "false_refusal_rate": rate(false_refusals, non_refusal),
         "missed_refusal_rate": rate(missed_refusals, refusal_items),
         "unsupported_figure_rate": rate(unsupported, answered),
@@ -528,6 +545,25 @@ def grounding_summary(results: list[ItemResult]) -> dict[str, Any]:
 
 def _fmt(value: float | None) -> str:
     return f"{value:.2f}" if value is not None else "  - "
+
+
+def _pct(value: float | None) -> str:
+    """A grounding rate, or ``n/a`` when its denominator was empty.
+
+    Never renders an unmeasured rate as a number: "0.0%" and "not measured" look alike
+    in a summary and only one of them is a pass.
+    """
+    return f"{value:.1%}" if value is not None else "n/a"
+
+
+def _grounding_line(label: str, value: float | None, denominator: int, want: str) -> str:
+    """One grounding row, carrying the size of the set the rate was taken over.
+
+    The denominator is printed because the rate alone cannot distinguish "clean across
+    24 answers" from "nothing to measure" — the ambiguity that let two all-errored runs
+    read as passes and hid the q16 unsupported-figure bug.
+    """
+    return f"  {label:<28}{_pct(value):<9}n={denominator:<5}want {want}"
 
 
 def _mean(values: list[float | None]) -> float | None:
@@ -614,13 +650,19 @@ def print_report(
     print("\n" + "=" * 78)
     print("GROUNDING CHECKS (ours — what Ragas does not measure)")
     print("=" * 78)
-    print(f"  answered / errored          {grounding['answered']} / {grounding['errored']}")
-    print(f"  citation rate               {grounding['citation_rate']:.1%}  (want 100%)")
-    print(f"  false refusal rate          {grounding['false_refusal_rate']:.1%}  (want 0%)")
-    print(f"  missed refusal rate         {grounding['missed_refusal_rate']:.1%}  (want 0%)")
-    print(f"  unsupported figure rate     {grounding['unsupported_figure_rate']:.1%}  (want 0%)")
-    print(f"  contradiction rate          {grounding['contradiction_rate']:.1%}  (want 0%)")
-    print(f"  invented citation rate      {grounding['invented_citation_rate']:.1%}  (want 0%)")
+    answered_n = grounding["answered"]
+    non_refusal_n = grounding["non_refusal_answered"]
+    refusal_n = grounding["refusal_answered"]
+    print(f"  answered / errored          {answered_n} / {grounding['errored']}")
+    for label, key, denominator, want in (
+        ("citation rate", "citation_rate", non_refusal_n, "100%"),
+        ("false refusal rate", "false_refusal_rate", non_refusal_n, "0%"),
+        ("missed refusal rate", "missed_refusal_rate", refusal_n, "0%"),
+        ("unsupported figure rate", "unsupported_figure_rate", answered_n, "0%"),
+        ("contradiction rate", "contradiction_rate", answered_n, "0%"),
+        ("invented citation rate", "invented_citation_rate", answered_n, "0%"),
+    ):
+        print(_grounding_line(label, grounding[key], denominator, want))
 
     for label, key in (
         ("false refusals", "false_refusals"),
@@ -662,9 +704,13 @@ def print_report(
             ("contradictions", "contradiction_rate"),
             ("invented_citations", "invented_citation_rate"),
         ):
-            if grounding[key] > 0:
+            # None means the denominator was empty, so there is nothing to fail on —
+            # a --kinds refusal run has no non-refusal answers by design. The rate
+            # prints as n/a rather than being counted as a clean 0%.
+            value = grounding[key]
+            if value is not None and value > 0:
                 failures.append(label)
-        if grounding["citation_rate"] < 1.0:
+        if grounding["citation_rate"] is not None and grounding["citation_rate"] < 1.0:
             failures.append("uncited_answers")
 
     print("\n" + "=" * 78)

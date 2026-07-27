@@ -200,7 +200,108 @@ def test_errored_items_are_counted_separately() -> None:
 def test_empty_run_does_not_divide_by_zero() -> None:
     summary = grounding_summary([])
     assert summary["answered"] == 0
+    assert summary["false_refusal_rate"] is None
+
+
+# ── Unmeasured rates must not read as clean ones ─────────────────────────────
+
+
+def test_empty_run_reports_rates_as_unmeasured_not_zero() -> None:
+    """Regression: an empty run reported a flawless grounding scorecard.
+
+    Every rate divided by an empty set and came back 0% (or 100% for citations), which
+    is indistinguishable from a genuinely clean run in the printed summary.
+    """
+    summary = grounding_summary([])
+    for key in (
+        "citation_rate",
+        "false_refusal_rate",
+        "missed_refusal_rate",
+        "unsupported_figure_rate",
+        "contradiction_rate",
+        "invented_citation_rate",
+    ):
+        assert summary[key] is None, f"{key} claimed a value over zero answers"
+
+
+def test_all_errored_run_reports_rates_as_unmeasured() -> None:
+    """The shape of the run that hid the q16 bug: 24 questions, none answered."""
+    answers = [_errored() for _ in range(24)]
+    summary = grounding_summary(answers)
+
+    assert summary["answered"] == 0
+    assert summary["errored"] == 24
+    assert summary["citation_rate"] is None
+    assert summary["unsupported_figure_rate"] is None
+
+
+def test_an_empty_run_never_prints_a_passing_scorecard() -> None:
+    """The property that matters: nothing measured must never read as everything fine."""
+    from src.evals import print_report
+
+    for answers in ([], [_errored() for _ in range(24)]):
+        report = print_report([], answers, grounding_summary(answers), 1.0)
+        grounding = report["grounding"]
+        assert grounding["citation_rate"] is None
+        assert grounding["unsupported_figure_rate"] is None
+        # No grounding failure may be claimed either — there is nothing to claim it from.
+        assert "unsupported_figures" not in report["below_target"]
+        assert "uncited_answers" not in report["below_target"]
+
+
+def test_vacuous_denominator_is_not_reported_as_a_perfect_rate() -> None:
+    """A --kinds refusal run answers plenty but has no non-refusal items.
+
+    It used to report a 100% citation rate and a 0% false refusal rate over zero
+    applicable answers, which reads as two passes that were never measured.
+    """
+    refusals_only = [_result("refusal", refused=True, citations=0) for _ in range(4)]
+    summary = grounding_summary(refusals_only)
+
+    assert summary["answered"] == 4
+    assert summary["refusal_answered"] == 4
+    assert summary["non_refusal_answered"] == 0
+    assert summary["missed_refusal_rate"] == 0.0, "this one *was* measured"
+    assert summary["citation_rate"] is None
+    assert summary["false_refusal_rate"] is None
+
+
+def test_unmeasured_rates_are_printed_as_na() -> None:
+    """The summary must say n/a, not a number, for a rate with no denominator."""
+    from src.evals import _grounding_line, _pct
+
+    assert _pct(None) == "n/a"
+    assert _pct(0.0) == "0.0%"
+
+    unmeasured = _grounding_line("unsupported figure rate", None, 0, "0%")
+    assert "n/a" in unmeasured and "n=0" in unmeasured
+    assert "0.0%" not in unmeasured, "an unmeasured rate must not render as a clean 0%"
+
+    measured = _grounding_line("unsupported figure rate", 0.0, 24, "0%")
+    assert "0.0%" in measured and "n=24" in measured
+
+
+def test_the_grounding_line_always_shows_its_denominator() -> None:
+    """The rate alone cannot separate 'clean over 24' from 'nothing measured'."""
+    assert "n=24" in _grounding_line_for(0.0, 24)
+    assert "n=0" in _grounding_line_for(None, 0)
+
+
+def _grounding_line_for(value: float | None, denominator: int) -> str:
+    from src.evals import _grounding_line
+
+    return _grounding_line("citation rate", value, denominator, "100%")
+
+
+def test_a_measured_clean_run_still_reports_real_rates() -> None:
+    """The guard must not turn genuine passes into n/a."""
+    results = [_result("document"), _result("policy"), _result("refusal", refused=True, citations=0)]
+    summary = grounding_summary(results)
+
+    assert summary["citation_rate"] == 1.0
     assert summary["false_refusal_rate"] == 0.0
+    assert summary["missed_refusal_rate"] == 0.0
+    assert summary["unsupported_figure_rate"] == 0.0
 
 
 # ── Verdicts ─────────────────────────────────────────────────────────────────

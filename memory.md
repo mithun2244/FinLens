@@ -356,10 +356,27 @@ DoD item claiming graceful rate-limit handling had only ever been exercised on t
 non-streaming path — and streaming is the path the UI uses. Fixed, regression-tested, and the
 DoD item corrected in `phases.md` rather than left standing.
 
-**Four bugs in the evaluator itself,** all found by running it: LLM-only fields were checked
+**Five bugs in the evaluator itself,** all found by running it: LLM-only fields were checked
 during a deterministic-only run (marking every fixture failed for fields never attempted); the
 summary printed "PASS" while individual fixtures showed FAIL, because field accuracy had no
-target; judge calls were unpaced; and retries reused an already-awaited coroutine.
+target; judge calls were unpaced; retries reused an already-awaited coroutine; and (2026-07-27)
+**grounding rates divided by an empty set and printed a flawless scorecard.**
+
+That fifth one is the most dangerous, because it fails toward false confidence. A run where all
+24 questions errored printed `citation rate 100.0%`, `unsupported figure rate 0.0%`,
+`contradiction rate 0.0%` — indistinguishable from a clean run. It is how the q16 bug stayed
+invisible: two runs were read as passes on rates taken over zero answers. The per-metric case
+was just as bad, since denominators differ — a `--kinds refusal` run reported a perfect citation
+rate over zero non-refusal answers.
+
+Fixed by making `rate()` return `None` (not `0.0`) on an empty denominator, rendering that as
+`n/a`, and **printing every rate with its denominator** (`0.0%  n=24` vs `n/a  n=0`), so a
+reader cannot mistake "clean across 24" for "nothing to measure". Failure comparisons are
+None-safe: an unmeasured rate cannot fail either, so `--kinds refusal` does not fail for lacking
+non-refusal items. The existing `errored_items` guard already stopped such runs from *passing*;
+what was broken was the display, which is what people actually read.
+
+**When reading any eval output, check `answered/errored` and `n=` before believing a rate.**
 
 **Decisions:** D-26 (judge transport, amends D-13), D-27 (daily token cap), D-28 (streaming
 error translation), **D-29 (OQ-1 resolved — Streamlit, superseding D-9)**.
