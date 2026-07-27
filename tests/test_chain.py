@@ -226,6 +226,79 @@ def test_cross_check_without_a_record_still_uses_context() -> None:
     assert checks[0].found_in_context
 
 
+# ── Figures disclosed by our own validators ──────────────────────────────────
+
+
+@pytest.fixture
+def unbalanced_record() -> FinancialRecord:
+    """Line items + tax = 501.27, but the document states 528.40 — a 27.13 gap."""
+    record = FinancialRecord(
+        document_id="northwind",
+        filename="unbalanced_invoice.pdf",
+        vendor_name="Northwind Traders",
+        document_type="invoice",
+        currency="USD",
+        line_items=[
+            LineItem(description="EC2 t3.medium instance-hours", amount=Decimal("30.66"), source_page=1),
+            LineItem(description="NAT Gateway data processing (GB)", amount=Decimal("412.90"), source_page=1),
+            LineItem(description="S3 Standard storage", amount=Decimal("18.44"), source_page=1),
+        ],
+        subtotal=Decimal("462.00"),
+        tax_lines=[TaxLine(label="Sales Tax", rate=Decimal("0.085"), amount=Decimal("39.27"))],
+        total_amount=Decimal("528.40"),
+    )
+    record.validate_arithmetic()
+    return record
+
+
+def test_arithmetic_discrepancy_is_supported(unbalanced_record: FinancialRecord) -> None:
+    """Regression (eval q16): the verifier penalised the model for repeating a figure
+    the backend handed it. ``_format_record`` shows the mismatch warning, which states
+    the difference outright, so naming it is reading — not inventing."""
+    text = "The figures do not add up: there is a discrepancy of 27.13 USD."
+    checks = cross_check_numbers(text, unbalanced_record, [])
+    discrepancy = next(c for c in checks if c.claimed == Decimal("27.13"))
+    assert discrepancy.is_supported
+    assert not discrepancy.contradicts_record
+
+
+def test_any_figure_a_warning_discloses_is_grounded(record: FinancialRecord) -> None:
+    """The warning text is the fallback behind the named entries, so a figure disclosed
+    by some *other* validator is grounded without needing its own entry."""
+    record.extraction_warnings.append("Page 2 subtotal of 84.19 could not be reconciled.")
+    checks = cross_check_numbers("An unreconciled 84.19 remains.", record, [])
+    assert checks[0].found_in_context
+
+
+def test_a_balanced_record_does_not_ground_a_derived_figure(
+    record: FinancialRecord,
+) -> None:
+    """The anti-laundering guard: a figure is grounded only when the warning disclosing
+    it was actually emitted. This record balances, so no difference was ever shown to
+    the model and 0.00-adjacent arithmetic must not pass as read-from-source."""
+    record.validate_arithmetic()
+    checks = cross_check_numbers("The shortfall is 27.13 USD.", record, [])
+    assert not checks[0].is_supported
+
+
+def test_a_within_tolerance_difference_is_not_grounded() -> None:
+    """A sub-tolerance gap emits no warning, so it is never shown — and must not verify."""
+    record = FinancialRecord(
+        document_id="rounding",
+        filename="rounding.pdf",
+        vendor_name="Rounding Co.",
+        document_type="invoice",
+        currency="USD",
+        line_items=[LineItem(description="Service", amount=Decimal("100.00"), source_page=1)],
+        subtotal=Decimal("100.00"),
+        total_amount=Decimal("100.01"),
+    )
+    record.validate_arithmetic()
+    assert record.extraction_warnings == [], "fixture assumes no warning is emitted"
+    checks = cross_check_numbers("The rounding gap is 0.01 USD.", record, [])
+    assert not checks[0].is_supported
+
+
 # ── Refusal detection ────────────────────────────────────────────────────────
 
 
@@ -253,6 +326,34 @@ def test_refusal_at_the_start_is_still_detected() -> None:
         "To answer, I would need the company's payroll records."
     )
     assert _looks_like_refusal(text)
+
+
+def test_paraphrased_refusal_is_detected() -> None:
+    """Regression (eval q28): a refusal that paraphrases the mandated sentence.
+
+    The model declined correctly but wrote "is not available" rather than the canonical
+    phrase, and cited the documents it had checked — so neither the marker list nor the
+    "a refusal cites nothing" assumption caught it.
+    """
+    text = (
+        "The account holder's home address is not available. "
+        "The provided documents [clean_invoice.pdf:1] and [cloud_billing_policy.md:1] do "
+        "not contain it; they include the vendor's address but no customer address."
+    )
+    assert _looks_like_refusal(text)
+
+
+def test_a_partial_answer_is_not_a_refusal() -> None:
+    """The opener markers must not fire on an answer that is merely incomplete.
+
+    ``is_trustworthy`` accepts ``refused`` in place of citations, so flagging a
+    substantive answer as a refusal would pass ungrounded text off as grounded.
+    """
+    text = (
+        "The invoice total is 501.27 USD [clean_invoice.pdf:1]. A per-service tax "
+        "breakdown is not available in the line items shown."
+    )
+    assert not _looks_like_refusal(text)
 
 
 # ── Prompt assembly ──────────────────────────────────────────────────────────

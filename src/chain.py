@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from pydantic import BaseModel
 
 from src import LLMError, RateLimitError
-from src.config import MODELS_BY_ROLE, REASONING_MODEL
+from src.config import AMOUNT_TOLERANCE, MODELS_BY_ROLE, REASONING_MODEL
 from src.llm import (
     get_chat_model,
     invoke_with_retry,
@@ -76,11 +76,12 @@ GROUNDING RULES — these are absolute:
 1. Every factual claim must be supported by the provided context. Cite it inline, \
 immediately after the claim, as [filename:page].
 2. Never state a figure that does not appear in the EXTRACTED RECORD or the RETRIEVED \
-CONTEXT. Do not add, subtract, or otherwise compute new amounts. If a number is not \
-given to you, say it is not available.
-3. If the context does not answer the question, say exactly: "I cannot determine this \
-from the provided documents." Then say what would be needed. A refusal is a correct \
-answer; a guess is not.
+CONTEXT. Do not add, subtract, or otherwise compute new amounts. If a figure is not given \
+to you, say so plainly rather than working it out.
+3. If the context does not answer the question — whether what is missing is a figure, a \
+name, an address, a date, or anything else — open with this sentence verbatim: "I cannot \
+determine this from the provided documents." Do not paraphrase it. Then say what would be \
+needed. A refusal is a correct answer; a guess is not.
 4. Keep what the DOCUMENT says separate from what the POLICY says. Attribute each \
 explicitly, e.g. "your invoice shows X [invoice.pdf:1], and your billing policy states \
 Y [policy.md:1]".
@@ -106,6 +107,28 @@ _REFUSAL_MARKERS = (
     "not available in the provided",
     "does not appear in the provided",
 )
+
+#: Refusal wordings that name no source, matched only in the opening sentence.
+#:
+#: The system prompt mandates one canonical refusal sentence, but models paraphrase it —
+#: a missing address came back as "The account holder's home address is not available."
+#: These catch that drift. They are deliberately not checked against the whole
+#: :data:`_REFUSAL_WINDOW`: unlike the markers above they do not require "the provided
+#: ...", so mid-answer they match ordinary partial answers ("the tax breakdown is not
+#: available, but the total is ..."). Mislabelling one of those costs more than a missed
+#: refusal — :attr:`Answer.is_trustworthy` treats ``refused`` as standing in for
+#: citations, so a false positive would pass an uncited answer off as grounded.
+_REFUSAL_OPENERS = (
+    "is not available",
+    "are not available",
+    "do not contain",
+    "does not contain",
+    "is not stated",
+    "is not disclosed",
+)
+
+#: Ends a sentence. Used to isolate the opening sentence for :data:`_REFUSAL_OPENERS`.
+_SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 
 #: A citation marker: ``[invoice.pdf:1]`` or ``[invoice.pdf: p.1]``.
 _CITATION_RE = re.compile(r"\[([^\[\]]+?):\s*(?:p\.?\s*)?(\d+)\s*\]")
@@ -283,10 +306,43 @@ def _record_amounts(record: FinancialRecord | None) -> dict[str, Decimal]:
     if record.subtotal is not None:
         amounts["subtotal"] = record.subtotal
     amounts["computed_total"] = record.computed_total
+    amounts["line_item_total"] = record.line_item_total
     for tax in record.tax_lines:
         amounts[f"tax:{tax.label}"] = tax.amount
     for index, item in enumerate(record.line_items):
         amounts[f"line_item:{index}:{item.description[:30]}"] = item.amount
+    amounts.update(_validator_amounts(record))
+    return amounts
+
+
+def _validator_amounts(record: FinancialRecord) -> dict[str, Decimal]:
+    """Figures our own validators derive and disclose to the model.
+
+    :func:`_format_record` hands the model ``extraction_warnings``, and an arithmetic
+    mismatch warning states the difference outright ("difference 27.13"). That figure is
+    in no line item and no retrieved snippet, so reporting it back scored as an
+    unsupported figure — the verifier penalised the model for repeating something the
+    backend told it. Answering "do these figures add up?" *requires* naming the gap.
+
+    The conditions below deliberately mirror
+    :meth:`FinancialRecord.validate_arithmetic` rather than deriving whatever they can.
+    A figure counts as grounded only when the warning that discloses it was actually
+    emitted; a discrepancy inside tolerance is never shown to the model, so it must not
+    be verifiable either. Otherwise this becomes a laundering channel, where any number
+    the model can reach by arithmetic passes as "read from a source".
+    """
+    amounts: dict[str, Decimal] = {}
+
+    if record.total_amount is not None:
+        difference = abs(record.computed_total - record.total_amount)
+        if difference > AMOUNT_TOLERANCE:
+            amounts["validator:total_difference"] = difference
+
+    if record.subtotal is not None:
+        difference = abs(record.subtotal - record.line_item_total)
+        if difference > AMOUNT_TOLERANCE:
+            amounts["validator:subtotal_difference"] = difference
+
     return amounts
 
 
@@ -305,7 +361,17 @@ def cross_check_numbers(
 ) -> list[NumericCheck]:
     """Trace every monetary figure in an answer back to its source (FR-4.4, Rule 5)."""
     amounts = _record_amounts(record)
-    haystack = " ".join(hit.snippet for hit in context).replace(",", "")
+
+    # Validator warnings belong in the haystack because _format_record shows them to the
+    # model verbatim, which makes them a source it read from just as much as a retrieved
+    # snippet is. Kept as a text fallback behind the named entries in _validator_amounts:
+    # those give the UI real provenance ("validator:total_difference") where this only
+    # says "seen somewhere", but this keeps working if a warning's wording changes or a
+    # new validator starts disclosing a figure.
+    sources = [hit.snippet for hit in context]
+    if record is not None:
+        sources.extend(record.extraction_warnings)
+    haystack = " ".join(sources).replace(",", "")
     checks: list[NumericCheck] = []
     seen: set[Decimal] = set()
 
@@ -336,8 +402,9 @@ def cross_check_numbers(
             )
             continue
 
-        # 2. Does it appear verbatim in something retrieved — a policy threshold, or a
-        #    figure from a *different* document in a multi-document question? Either way
+        # 2. Does it appear verbatim in something the model was shown — a policy
+        #    threshold, a figure from a *different* document in a multi-document
+        #    question, or a discrepancy one of our own validators disclosed? Either way
         #    it was read from a source, so it is grounded and is not a contradiction of
         #    the active record.
         if found:
@@ -369,7 +436,12 @@ _REFUSAL_WINDOW = 160
 
 def _looks_like_refusal(text: str) -> bool:
     opening = text[:_REFUSAL_WINDOW].lower()
-    return any(marker in opening for marker in _REFUSAL_MARKERS)
+    if any(marker in opening for marker in _REFUSAL_MARKERS):
+        return True
+
+    end = _SENTENCE_END_RE.search(opening)
+    first_sentence = opening[: end.start()] if end else opening
+    return any(marker in first_sentence for marker in _REFUSAL_OPENERS)
 
 
 # ── Answering ────────────────────────────────────────────────────────────────

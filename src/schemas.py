@@ -366,9 +366,10 @@ class NumericCheck(_Base):
 
     Two distinct questions are asked of every number the model states:
 
-    - **Is it supported?** Does it match a field of the extracted record, or appear
-      verbatim in a retrieved snippet? A figure supported by neither was produced by the
-      model rather than read from a source, which is precisely what Rule 5 forbids.
+    - **Is it supported?** Does it match a field of the extracted record, a discrepancy
+      one of our own validators disclosed, or a figure appearing verbatim in a retrieved
+      snippet? A figure supported by none of those was produced by the model rather than
+      read from a source, which is precisely what Rule 5 forbids.
     - **Does it contradict?** Where it names a record field, does the value agree?
 
     An unsupported figure is the more serious finding, and the earlier version of this
@@ -380,7 +381,8 @@ class NumericCheck(_Base):
     #: Record field this figure matches, e.g. ``"total_amount"``. ``None`` if it matches none.
     matched_field: str | None = None
     expected: Decimal | None = None
-    #: True when the figure appears verbatim in a retrieved chunk (e.g. a policy threshold).
+    #: True when the figure appears verbatim in something the model was shown — a
+    #: retrieved chunk (e.g. a policy threshold) or an ``extraction_warnings`` entry.
     found_in_context: bool = False
 
     @property

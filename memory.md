@@ -306,12 +306,49 @@ serves cleanly (HTTP 200, no errors).
 discriminates), but a full run needs ~220k tokens against a 100k/day cap (D-27). All 28 golden
 questions *were* answered successfully in the first run; only the scoring phase failed.
 
-**Open finding — refusal correctness (unresolved):** in the completed answering phase,
-3 of the 4 refusal cases did not set `refused`. q25 was re-tested in isolation and is correct
-(refuses cleanly, detector catches it); q26–q28 could not be re-tested before the daily cap hit.
-**Cause is undetermined** — either the model answered when it should not have (a grounding
-failure), or it refused in wording the 160-character detector misses (a detector gap). Do not
-assume which. `q28` returning 3 citations hints at the former, since a refusal cites nothing.
+**Resolved (2026-07-27) — refusal correctness was a detector gap, not a grounding failure.**
+Re-run of `--kinds refusal` in isolation: q25–q27 refuse and are detected correctly, so the
+earlier "3 of 4 failed" was an artifact of the interrupted run. Only q28 genuinely missed, and
+inspecting its text showed the model *had* declined correctly — it just paraphrased the
+mandated sentence as "The account holder's home address is not available." The citation-count
+hint recorded here was misleading: q28 cited the documents it had *checked*, so "a refusal
+cites nothing" does not hold.
+
+Root cause was a prompt collision. Rule 2 said "If a number is not given to you, say it is not
+available" while rule 3 mandated "I cannot determine this from the provided documents"; for a
+missing *non-numeric* field the model reached for rule 2's wording, which the marker list did
+not know. Fixed on both sides: rule 3 now covers any missing fact and demands its sentence
+verbatim (this is what actually fixed q28 — it now refuses with zero citations), and
+`_REFUSAL_OPENERS` catches paraphrases as defence-in-depth. Those openers are matched only
+against the **first sentence**, not the full 160-char window: they do not require "the provided
+...", so mid-answer they would match ordinary partial answers, and `is_trustworthy` accepts
+`refused` in place of citations — a false positive would pass an uncited answer off as grounded.
+Verified no false refusals across all 24 non-refusal questions.
+
+**Resolved (2026-07-27) — `q16`'s unsupported figure (27.13) was a verifier gap.** It was
+never a regression: the two earlier runs showing `unsupported_figure_rate 0.0` never answered
+q16 at all (corrupt index; rate limit), so that 0.0 was 0-of-0. **When reading this metric,
+always check `answered/errored` first — a rate over zero answered items reads as a pass.**
+
+`validate_arithmetic` puts "(difference 27.13)" in `extraction_warnings` and `_format_record`
+shows it to the model, but `cross_check_numbers` built its haystack from retrieved snippets
+only and `_record_amounts` exposed no discrepancy field — so the verifier penalised the model
+for repeating a figure the backend itself supplied. Answering "do these figures add up?"
+*requires* naming the gap, and the golden reference expects it, so suppressing the figure would
+have been the wrong fix.
+
+Fixed on two levels: `_validator_amounts` names the disclosed discrepancies
+(`validator:total_difference`, `validator:subtotal_difference`), and the warning text now joins
+the haystack as a fallback that keeps working if wording changes or a new validator starts
+disclosing figures. q16 now reports zero unsupported figures with 27.13 attributed to
+`validator:total_difference`.
+
+**The guard that matters here:** `_validator_amounts` mirrors `validate_arithmetic`'s
+conditions exactly rather than deriving whatever it can. A figure is grounded only when the
+warning disclosing it was actually emitted — a sub-tolerance difference is never shown to the
+model, so it must not verify either. Without that, this becomes a laundering channel where any
+number reachable by arithmetic passes as "read from a source". Regression-tested in both
+directions (`test_a_within_tolerance_difference_is_not_grounded`).
 
 **Bug found by the eval that the Phase 4 tests missed (D-28):** a provider 429 raised *while
 iterating* `model.stream()` escaped untranslated and crashed with a raw traceback. The Phase 4
