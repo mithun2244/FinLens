@@ -35,7 +35,15 @@ EVAL_REPORTS_DIR: Final[Path] = EVALS_DIR / "reports"
 
 # ── Groq model IDs (decision D-4: the ONLY place these strings appear) ────────
 
-#: Primary reasoning model for grounded RAG answers (FR-4). Verified served 2026-07-25.
+#: Primary reasoning model for grounded RAG answers (FR-4). Verified served 2026-07-28.
+#:
+#: Do not swap this to dodge a spent daily budget. ``openai/gpt-oss-120b`` was tried on
+#: 2026-07-27 for exactly that reason — Groq meters each model separately, so it does buy
+#: a fresh bucket — and the sweep it unblocked was not comparable: citation rate 58.3%
+#: over 24 questions, and ``billing_date`` dropped from ``scanned_receipt.png``, which is
+#: a scored extraction field, not just an answer-quality wobble. The extractor
+#: shares this constant, so a swap moves the deterministic numbers too. Wait for the
+#: refill instead, or accept that the run measures the substitute rather than the system.
 REASONING_MODEL: Final[str] = "llama-3.3-70b-versatile"
 
 #: Cheap/fast model for query rewriting, classification, and the Ragas judge (D-10).
