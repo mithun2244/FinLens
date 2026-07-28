@@ -587,7 +587,15 @@ def answer_question(
         if event.type == "answer" and event.answer is not None:
             return event.answer
         if event.type == "error":
-            raise LLMError(event.message or "The question could not be answered.")
+            message = event.message or "The question could not be answered."
+            # Re-raise rate limits as rate limits, carrying the retry hint. Flattening
+            # every failure into a bare LLMError here discarded the one detail a caller
+            # can act on: a caller unable to tell a 7-second tokens-per-minute pause from
+            # a 16-minute daily-budget stop can only keep firing doomed requests. The
+            # eval suite did exactly that for 22 questions (see src/evals.py).
+            if event.retry_after_seconds is not None:
+                raise RateLimitError(message, retry_after_seconds=event.retry_after_seconds)
+            raise LLMError(message)
     raise LLMError("The model produced no answer.")
 
 

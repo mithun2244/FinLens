@@ -35,7 +35,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
-from src import AssistantError
+from src import AssistantError, RateLimitError
 from src.chain import answer_question
 from src.config import (
     COLLECTION_DOCUMENTS,
@@ -74,6 +74,24 @@ MAX_CONTEXT_CHARS = 500
 
 #: How many times to retry a judge call that was rate limited.
 JUDGE_ATTEMPTS = 4
+
+#: How many times to retry an *answer* call that was rate limited. The judge path has
+#: waited out 429s since D-27; the answer path had no retry at all, so a two-second
+#: tokens-per-minute pause cost the whole item.
+ANSWER_ATTEMPTS = 3
+
+#: A retry hint at or above this many seconds means the daily token budget is gone, not
+#: the per-minute one. Groq answers a tokens-per-minute 429 with a wait of seconds; the
+#: 100k-tokens/day bucket refills at ~1.2 tokens/s, so it answers with minutes — the
+#: observed hints were 16m and 18m. Neither waiting nor retrying helps at that scale, and
+#: every remaining question would spend a request to earn the identical 429.
+DAILY_LIMIT_RETRY_SECONDS = 120.0
+
+#: Recorded against questions a stopped run never reached. They stay in the results, and
+#: therefore in ``errored``, on purpose: an aborted run has not measured them, and a
+#: report that quietly shrinks its own denominator is the exact failure this suite exists
+#: to prevent (see :func:`grounding_summary`).
+NOT_ATTEMPTED = "Not attempted — the run stopped after the daily token budget ran out."
 
 
 def _retry_after_seconds(message: str) -> float | None:
@@ -415,6 +433,38 @@ async def _score_item(
     )
 
 
+async def _answer_item(
+    item: GoldenItem, record: FinancialRecord | None
+) -> tuple[Answer | None, AssistantError | None, float | None]:
+    """Answer one golden question, sleeping through short rate limits.
+
+    Returns ``(answer, failure, daily_limit_wait)``. A tokens-per-minute 429 clears in
+    seconds and is worth waiting out. A daily-budget 429 is handed back instead, with its
+    retry hint, so the caller can stop the run: no number of attempts conjures tokens that
+    do not exist, and the hint is the only thing that tells the two cases apart.
+    """
+    for attempt in range(1, ANSWER_ATTEMPTS + 1):
+        try:
+            answer = answer_question(
+                item.question, record=record, document_id=item.document_id
+            )
+            return answer, None, None
+        except RateLimitError as exc:
+            wait = exc.retry_after_seconds
+            if wait is not None and wait >= DAILY_LIMIT_RETRY_SECONDS:
+                return None, exc, wait
+            if attempt == ANSWER_ATTEMPTS:
+                return None, exc, None
+            logger.info(
+                "%s rate limited; waiting %.1fs (attempt %d/%d)",
+                item.id, wait or 10.0, attempt, ANSWER_ATTEMPTS,
+            )
+            await asyncio.sleep(wait or 10.0)
+        except AssistantError as exc:
+            return None, exc, None
+    raise AssertionError("unreachable: the loop returns on every path")
+
+
 async def evaluate_answers(
     items: list[GoldenItem],
     records: dict[str, FinancialRecord],
@@ -428,22 +478,45 @@ async def evaluate_answers(
     ~100 judge calls, each carrying a ~1,600-token prompt; fired back to back that
     saturates Groq's free-tier tokens-per-minute allowance and the run collapses into SDK
     retry backoff. Pacing makes the run slower but finite — see decision D-27.
+
+    The run stops on the first daily-budget rate limit. Pacing cannot help there: the
+    budget is spent for the day, so continuing spends one request per remaining question
+    to collect the same 429 each time. Unreached questions are still recorded, as errors,
+    so the report shows 24 items whatever happened rather than a shrunken denominator.
     """
     results: list[ItemResult] = []
 
     for index, item in enumerate(items, 1):
         record = records.get(item.document_id) if item.document_id else None
         result = ItemResult(item=item)
-        try:
-            result.answer = answer_question(
-                item.question, record=record, document_id=item.document_id
-            )
-            status = "refused" if result.answer.refused else f"{len(result.answer.citations)} cites"
-        except AssistantError as exc:
-            result.error = str(exc)
-            status = f"ERROR {type(exc).__name__}"
+        answer, failure, daily_limit_wait = await _answer_item(item, record)
+
+        result.answer = answer
+        if failure is not None:
+            result.error = str(failure)
+            status = f"ERROR {type(failure).__name__}"
+        else:
+            assert answer is not None  # _answer_item returns one or the other
+            status = "refused" if answer.refused else f"{len(answer.citations)} cites"
         print(f"  [{index:>2}/{len(items)}] {item.id} {item.kind:<14} {status}", flush=True)
         results.append(result)
+
+        if daily_limit_wait is not None:
+            unreached = items[index:]
+            results.extend(ItemResult(item=i, error=NOT_ATTEMPTED) for i in unreached)
+            print(
+                f"\n  STOPPED: Groq's daily token budget is exhausted — it asked for "
+                f"{daily_limit_wait / 60:.0f}m before the next call on this model.\n"
+                f"  {len(unreached)} question(s) left unattempted; they are reported as "
+                f"errors, not skipped.\n"
+                f"  Re-run once the budget refills, or point REASONING_MODEL "
+                f"(src/config.py) at a model with its own budget — Groq meters each one "
+                f"separately. Note that a re-run restarts: the answer path streams, and "
+                f"streamed responses do not go through the LLM cache.",
+                flush=True,
+            )
+            break
+
         if pace and index < len(items):
             await asyncio.sleep(pace)
 
