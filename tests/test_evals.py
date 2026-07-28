@@ -16,6 +16,7 @@ from decimal import Decimal
 
 import pytest
 
+from src import RateLimitError
 from src.config import EVALS_DIR, GOLDEN_SET_PATH
 from src.evals import (
     GROQ_OPENAI_BASE_URL,
@@ -23,6 +24,7 @@ from src.evals import (
     GoldenItem,
     ItemResult,
     _verdict,
+    evaluate_answers,
     grounding_summary,
     load_golden_set,
 )
@@ -499,3 +501,75 @@ def test_kinds_flag_strips_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
 
     evals.main(["--kinds", "policy, refusal", "--no-score"])
     assert seen["kinds"] == ["policy", "refusal"]
+
+
+# ── Daily-limit abort (2026-07-27) ───────────────────────────────────────────
+#
+# A sweep hit Groq's daily token budget on q02 and then spent 22 more requests
+# collecting the identical 429. These pin the stop, and pin that stopping does not
+# quietly shrink the report's denominator.
+
+
+def _golden(n: int) -> list[GoldenItem]:
+    return [
+        GoldenItem(id=f"q{i:02d}", kind="document", question="q?", reference="r")
+        for i in range(1, n + 1)
+    ]
+
+
+def test_daily_limit_stops_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 429 asking for minutes stops the run instead of burning the remaining items."""
+    import asyncio
+
+    import src.evals as evals
+
+    calls: list[str] = []
+
+    def _fake(question, *, record=None, document_id=None):  # type: ignore[no-untyped-def]
+        calls.append(question)
+        if len(calls) == 1:
+            return _answer()
+        raise RateLimitError("daily budget gone", retry_after_seconds=960.0)
+
+    monkeypatch.setattr(evals, "answer_question", _fake)
+    results = asyncio.run(evaluate_answers(_golden(24), {}, score=False, pace=0))
+
+    assert len(calls) == 2, "must stop at the first daily limit, not retry or continue"
+    assert len(results) == 24, "unreached questions stay in the report"
+    assert results[0].answer is not None
+    assert results[1].error == "daily budget gone"
+    assert all(r.error == evals.NOT_ATTEMPTED for r in results[2:])
+
+
+def test_stopped_run_still_counts_unreached_items_as_errors() -> None:
+    """The abort must not let a run that measured 1 of 24 read as a clean scorecard."""
+    import src.evals as evals
+
+    results = [ItemResult(item=_golden(1)[0], answer=_answer())]
+    results += [ItemResult(item=i, error=evals.NOT_ATTEMPTED) for i in _golden(23)]
+
+    summary = grounding_summary(results)
+
+    assert summary["answered"] == 1
+    assert summary["errored"] == 23, "unreached items are unmeasured, not passed"
+
+
+def test_short_rate_limit_is_waited_out_not_abandoned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tokens-per-minute 429 clears in seconds, so it must cost a pause, not the item."""
+    import asyncio
+
+    import src.evals as evals
+
+    attempts: list[int] = []
+
+    def _fake(question, *, record=None, document_id=None):  # type: ignore[no-untyped-def]
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RateLimitError("per-minute", retry_after_seconds=0.01)
+        return _answer()
+
+    monkeypatch.setattr(evals, "answer_question", _fake)
+    results = asyncio.run(evaluate_answers(_golden(1), {}, score=False, pace=0))
+
+    assert len(attempts) == 2, "the short wait must be retried"
+    assert results[0].answer is not None and results[0].error is None
