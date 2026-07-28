@@ -569,6 +569,7 @@ def grounding_summary(results: list[ItemResult]) -> dict[str, Any]:
     unsupported = [r for r in answered if r.answer and r.answer.unsupported_figures]
     contradicting = [r for r in answered if r.answer and r.answer.contradicting_figures]
     invented_cites = [r for r in answered if r.answer and r.answer.dropped_citations]
+    derived = [r for r in answered if r.answer and r.answer.derived_figures]
 
     def rate(subset: list[ItemResult], total: list[ItemResult]) -> float | None:
         """The share of ``total`` in ``subset``, or ``None`` when nothing was measured.
@@ -599,6 +600,11 @@ def grounding_summary(results: list[ItemResult]) -> dict[str, Any]:
         "unsupported_figure_rate": rate(unsupported, answered),
         "contradiction_rate": rate(contradicting, answered),
         "invented_citation_rate": rate(invented_cites, answered),
+        #: Not a pass/fail rate. Derived figures are excluded from unsupported_figure_rate
+        #: because the model showed verified working, so without this line they would
+        #: vanish from the report entirely — and a category nobody looks at is where a
+        #: regression hides. Reported so the derivations can be read and judged.
+        "derived_figure_rate": rate(derived, answered),
         "false_refusals": [r.item.id for r in false_refusals],
         "missed_refusals": [r.item.id for r in missed_refusals],
         "uncited": [r.item.id for r in uncited],
@@ -609,6 +615,11 @@ def grounding_summary(results: list[ItemResult]) -> dict[str, Any]:
         ],
         "invented_citations": [
             f"{r.item.id}:{r.answer.dropped_citations}" for r in invented_cites if r.answer
+        ],
+        "derived": [
+            f"{r.item.id}:{[f'{c.derivation} = {c.claimed}' for c in r.answer.derived_figures]}"
+            for r in derived
+            if r.answer
         ],
     }
 
@@ -734,6 +745,9 @@ def print_report(
         ("unsupported figure rate", "unsupported_figure_rate", answered_n, "0%"),
         ("contradiction rate", "contradiction_rate", answered_n, "0%"),
         ("invented citation rate", "invented_citation_rate", answered_n, "0%"),
+        # "review" rather than a target: a verified derivation is not a defect, but it is
+        # the model doing arithmetic, so the working is printed below to be read.
+        ("derived figure rate", "derived_figure_rate", answered_n, "review"),
     ):
         print(_grounding_line(label, grounding[key], denominator, want))
 
@@ -743,6 +757,7 @@ def print_report(
         ("uncited answers", "uncited"),
         ("unsupported figures", "unsupported"),
         ("invented citations", "invented_citations"),
+        ("derived figures (verified working)", "derived"),
     ):
         if grounding[key]:
             print(f"\n  {label}: {grounding[key]}")

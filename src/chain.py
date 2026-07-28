@@ -16,6 +16,7 @@ of wrong numbers in invoice RAG (architecture.md §6).
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import re
@@ -76,8 +77,13 @@ GROUNDING RULES — these are absolute:
 1. Every factual claim must be supported by the provided context. Cite it inline, \
 immediately after the claim, as [filename:page].
 2. Never state a figure that does not appear in the EXTRACTED RECORD or the RETRIEVED \
-CONTEXT. Do not add, subtract, or otherwise compute new amounts. If a figure is not given \
-to you, say so plainly rather than working it out.
+CONTEXT. If a figure is not given to you, say so plainly rather than working it out.
+2a. One exception: when the question asks how an amount changed, or to compare two \
+amounts, you may state the difference. Show the working in the SAME SENTENCE as the \
+result, with both amounts cited — "the charge rose from 41.20 [may.pdf:1] to 412.90 \
+[june.pdf:1], an increase of 371.70". Both figures must be ones you were given. This is \
+the only arithmetic permitted: never compute percentages, ratios, totals, projections, \
+or tax, and never chain one computed figure into another.
 3. If the context does not answer the question — whether what is missing is a figure, a \
 name, an address, a date, or anything else — open with this sentence verbatim: "I cannot \
 determine this from the provided documents." Do not paraphrase it. Then say what would be \
@@ -346,6 +352,73 @@ def _validator_amounts(record: FinancialRecord) -> dict[str, Decimal]:
     return amounts
 
 
+#: Operands must sit in the same sentence as the figure they produce.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+#: Never treated as an operand. A zero term changes nothing arithmetically but multiplies
+#: the number of expressions that reach any given target: while investigating q23, a
+#: brute-force search matched 371.70 via ``412.90 - 0.00 - 41.20``, where the 0.00 was an
+#: "Interest Charged" line from an unrelated bank statement. Excluding zero removes a
+#: whole family of coincidental derivations that prove nothing.
+_ZERO = Decimal("0.00")
+
+
+def _declared_derivation(
+    claimed: Decimal, sentence: str, grounded: set[Decimal]
+) -> str | None:
+    """Check arithmetic the model *stated*, rather than hunting for arithmetic that fits.
+
+    The direction matters more than any other detail here. Searching the full context for
+    some expression equalling a figure would ground almost anything: with n figures in
+    play there are O(n²) differences, and a number reachable by arithmetic would pass as
+    "read from a source" — the laundering channel :func:`_validator_amounts` refuses to
+    open. This function never searches for a justification. It only confirms one the model
+    committed to in writing, and the constraints below are what make that distinction real:
+
+    - **Same sentence.** Operands must appear alongside the claim, so the model is
+      asserting the relationship rather than us inferring it. Cross-sentence pairs, and
+      the rest of the context entirely, are out of scope.
+    - **Exactly two operands, addition or subtraction, exact equality.** No percentages,
+      products, or ratios; those admit far more expressions per target and are where a
+      fabricated figure would most easily find cover.
+    - **Both operands independently grounded.** Arithmetic over a number the model also
+      invented proves nothing.
+    - **Unique.** If more than one pair yields the figure, the derivation is ambiguous and
+      no credit is given.
+
+    Returns the working, e.g. ``"412.90 - 41.20"``, or ``None``.
+    """
+    operands = []
+    for match in _FIGURE_RE.finditer(sentence):
+        try:
+            value = Decimal(match.group(1).replace(",", ""))
+        except Exception:  # noqa: BLE001 - a malformed figure is simply not an operand
+            continue
+        if value != claimed and value != _ZERO and value in grounded:
+            operands.append(value)
+
+    matches: list[str] = []
+    for left, right in itertools.permutations(sorted(set(operands)), 2):
+        if left - right == claimed:
+            matches.append(f"{left} - {right}")
+        if left + right == claimed and left <= right:
+            matches.append(f"{left} + {right}")
+
+    unique = sorted(set(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _sentence_at(text: str, position: int) -> str:
+    """The sentence containing ``position``."""
+    start = 0
+    for match in _SENTENCE_SPLIT_RE.finditer(text):
+        if match.end() > position:
+            break
+        start = match.end()
+    end = _SENTENCE_SPLIT_RE.search(text, position)
+    return text[start : end.start() if end else len(text)]
+
+
 def _labelled_field(text: str, position: int) -> str | None:
     """Which record field, if any, the words just before a figure name."""
     window = text[max(0, position - 45) : position]
@@ -372,6 +445,19 @@ def cross_check_numbers(
     if record is not None:
         sources.extend(record.extraction_warnings)
     haystack = " ".join(sources).replace(",", "")
+
+    # Values eligible to act as operands in a declared derivation: everything the model
+    # could have read. Extracted with the figure pattern rather than reusing the substring
+    # test below, which is the stricter of the two — a substring hit can land mid-number
+    # ("412.90" inside "1412.90"), and an operand admitted in error would let a wrong
+    # figure verify. Being stricter here can only cost a derivation credit, never grant one.
+    grounded_values: set[Decimal] = set(amounts.values())
+    for match in _FIGURE_RE.finditer(haystack):
+        try:
+            grounded_values.add(Decimal(match.group(1).replace(",", "")))
+        except Exception:  # noqa: BLE001 - a malformed figure is simply not an operand
+            continue
+
     checks: list[NumericCheck] = []
     seen: set[Decimal] = set()
 
@@ -411,8 +497,20 @@ def cross_check_numbers(
             checks.append(NumericCheck(claimed=claimed, found_in_context=True))
             continue
 
-        # 3. In neither. If the wording names a record field, this contradicts it;
-        #    otherwise the figure is unsupported outright.
+        # 3. Read from nowhere — but the model may have said where it came from. A
+        #    cross-document question ("how did this charge change?") is answered with a
+        #    delta that appears in no source by construction, and treating that as
+        #    invention made correct answers look fabricated. Only arithmetic the model
+        #    stated is accepted, and never as grounding: see _declared_derivation.
+        derivation = _declared_derivation(
+            claimed, _sentence_at(text, match.start()), grounded_values
+        )
+        if derivation is not None:
+            checks.append(NumericCheck(claimed=claimed, derivation=derivation))
+            continue
+
+        # 4. In neither, and unexplained. If the wording names a record field, this
+        #    contradicts it; otherwise the figure is unsupported outright.
         field = _labelled_field(text, match.start())
         checks.append(
             NumericCheck(

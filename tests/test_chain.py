@@ -611,3 +611,106 @@ def test_retrieved_is_empty_when_nothing_was_retrieved() -> None:
 
     answer = Answer(question="q", text="t", model="m", latency_seconds=0.0)
     assert answer.retrieved == []
+
+
+# ── Declared derivations (2026-07-29) ────────────────────────────────────────
+#
+# q23 asked how the NAT Gateway charge changed between two invoices. The model answered
+# correctly -- 41.20 to 412.90, both cited -- and was flagged for the difference, 371.70,
+# which appears in no source by construction. These pin the narrow exception that fixes
+# that, and the constraints that stop it becoming a laundering channel: a number the
+# model can reach by arithmetic must never pass as one it read.
+
+_MAY = _citation("prior_invoice.pdf", 1, "NAT Gateway data processing | Amount: 41.20")
+_JUNE = _citation("clean_invoice.pdf", 1, "NAT Gateway data processing | Amount: 412.90")
+
+
+def test_declared_cross_document_delta_is_derived_not_unsupported() -> None:
+    """The q23 case: both operands cited in the sentence, the difference stated with them."""
+    text = (
+        "The charge rose from 41.20 [prior_invoice.pdf:1] to 412.90 [clean_invoice.pdf:1], "
+        "an increase of 371.70."
+    )
+    checks = cross_check_numbers(text, None, [_MAY, _JUNE])
+    delta = next(c for c in checks if c.claimed == Decimal("371.70"))
+
+    assert delta.is_derived
+    assert delta.derivation == "412.90 - 41.20"
+    assert not delta.is_supported, "a derived figure was computed, never read from a source"
+
+
+def test_derived_figure_leaves_unsupported_list_but_is_still_reported() -> None:
+    """Excluded from unsupported, retained under derived_figures -- not silently dropped."""
+    from src.schemas import Answer
+
+    text = (
+        "The charge rose from 41.20 [prior_invoice.pdf:1] to 412.90 [clean_invoice.pdf:1], "
+        "an increase of 371.70."
+    )
+    answer = Answer(
+        question="q",
+        text=text,
+        citations=[_MAY, _JUNE],
+        numeric_checks=cross_check_numbers(text, None, [_MAY, _JUNE]),
+        model="m",
+        latency_seconds=0.0,
+    )
+
+    assert answer.unsupported_figures == []
+    assert [c.claimed for c in answer.derived_figures] == [Decimal("371.70")]
+
+
+def test_operand_in_a_different_sentence_earns_no_credit() -> None:
+    """Same-sentence scoping is the whole anti-laundering constraint."""
+    text = (
+        "May was 41.20 [prior_invoice.pdf:1]. June was 412.90 [clean_invoice.pdf:1]. "
+        "The increase was 371.70."
+    )
+    checks = cross_check_numbers(text, None, [_MAY, _JUNE])
+    delta = next(c for c in checks if c.claimed == Decimal("371.70"))
+
+    assert not delta.is_derived
+    assert not delta.is_supported
+
+
+def test_arithmetic_over_an_ungrounded_operand_earns_no_credit() -> None:
+    """999.90 is in no source, so 999.90 - 41.20 proves nothing about 958.70."""
+    text = "The charge went from 41.20 [prior_invoice.pdf:1] to 999.90, a rise of 958.70."
+    checks = cross_check_numbers(text, None, [_MAY])
+    delta = next(c for c in checks if c.claimed == Decimal("958.70"))
+
+    assert not delta.is_derived
+
+
+def test_zero_is_never_an_operand() -> None:
+    """A zero term reaches a target without evidence -- the 412.90 - 0.00 path from q23."""
+    zero = _citation("statement.pdf", 2, "Interest Charged 0.00")
+    text = "Interest was 0.00 [statement.pdf:2] so the charge of 412.90 [clean_invoice.pdf:1] stands."
+    checks = cross_check_numbers(text, None, [_JUNE, zero])
+    figure = next(c for c in checks if c.claimed == Decimal("412.90"))
+
+    assert figure.is_supported, "412.90 is in a snippet, so it is read, not derived"
+    assert not figure.is_derived
+
+
+def test_ambiguous_derivation_earns_no_credit() -> None:
+    """Two operand pairs reaching the same figure means neither is evidence."""
+    a = _citation("a.pdf", 1, "Amount: 100.00 and 50.00")
+    b = _citation("b.pdf", 1, "Amount: 80.00 and 30.00")
+    text = "Taking 100.00 [a.pdf:1] and 50.00 [a.pdf:1] with 80.00 [b.pdf:1] and 30.00 [b.pdf:1] gives 50.00."
+    checks = cross_check_numbers(text, None, [a, b])
+    figure = next(c for c in checks if c.claimed == Decimal("50.00"))
+
+    # 50.00 is itself in a snippet, so it is supported outright; the point is that the
+    # ambiguity never manufactures a derivation for it.
+    assert figure.derivation is None
+
+
+def test_invented_figure_is_still_unsupported() -> None:
+    """The exception must not weaken the rule it is an exception to."""
+    text = "Your account shows an outstanding balance of 4210.55."
+    checks = cross_check_numbers(text, None, [_MAY, _JUNE])
+    figure = next(c for c in checks if c.claimed == Decimal("4210.55"))
+
+    assert not figure.is_derived
+    assert not figure.is_supported

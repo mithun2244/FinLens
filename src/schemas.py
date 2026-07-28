@@ -384,11 +384,26 @@ class NumericCheck(_Base):
     #: True when the figure appears verbatim in something the model was shown — a
     #: retrieved chunk (e.g. a policy threshold) or an ``extraction_warnings`` entry.
     found_in_context: bool = False
+    #: The arithmetic the model declared for a figure it computed, e.g.
+    #: ``"412.90 - 41.20"``. Set only when that statement was checked and found exact, and
+    #: only when both operands are themselves grounded — see ``_declared_derivation``.
+    #:
+    #: This is deliberately NOT a third way of being supported. A derived figure was
+    #: produced by the model, not read from a source, and ``is_supported`` stays False so
+    #: it can never be counted as grounded. What this buys is provenance: the UI can show
+    #: the working, and evaluation can separate "the model did arithmetic we verified"
+    #: from "the model made a number up", which were previously the same finding.
+    derivation: str | None = None
 
     @property
     def is_supported(self) -> bool:
         """True when this figure was read from somewhere rather than produced."""
         return self.matched_field is not None or self.found_in_context
+
+    @property
+    def is_derived(self) -> bool:
+        """True when the model declared arithmetic for this figure and it checked out."""
+        return self.derivation is not None
 
     @property
     def contradicts_record(self) -> bool:
@@ -432,8 +447,23 @@ class Answer(_Base):
 
     @property
     def unsupported_figures(self) -> list[NumericCheck]:
-        """Figures found in neither the record nor the retrieved context (Rule 5)."""
-        return [check for check in self.numeric_checks if not check.is_supported]
+        """Figures found in neither the record nor the retrieved context (Rule 5).
+
+        Verified derivations are excluded: the model showed its working, both operands
+        were grounded, and the arithmetic was checked. They remain visible via
+        :attr:`derived_figures`, which is tracked separately precisely so that excluding
+        them here cannot quietly absorb a genuine fabrication.
+        """
+        return [
+            check
+            for check in self.numeric_checks
+            if not check.is_supported and not check.is_derived
+        ]
+
+    @property
+    def derived_figures(self) -> list[NumericCheck]:
+        """Figures the model computed from grounded operands, with the working checked."""
+        return [check for check in self.numeric_checks if check.is_derived]
 
     @property
     def contradicting_figures(self) -> list[NumericCheck]:
