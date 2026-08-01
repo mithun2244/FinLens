@@ -51,6 +51,12 @@ services:
       - key: GROQ_API_KEY
         sync: false
 
+      # The deployed frontend's origin, comma-separated for more than one. Without this
+      # the API keeps its localhost default and the browser blocks every call from the
+      # deployed UI. A wildcard is rejected at startup — see src/config.py.
+      - key: ALLOWED_ORIGINS
+        sync: false
+
       # Optional tracing. The app runs normally without these (decision D-11).
       - key: LANGCHAIN_TRACING_V2
         value: "false"
