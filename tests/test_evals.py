@@ -195,9 +195,21 @@ def test_golden_item_ids_are_unique() -> None:
 
 
 def test_document_scoped_items_name_a_document() -> None:
+    """``document_id`` decides retrieval scope, so it must match what the question asks.
+
+    Refusals are deliberately not checked here. They are defined by the answer they should
+    provoke, not by their scope: q25-q28 refuse something absent from one named invoice,
+    while q29 asks for an average across two and must stay unscoped to reach both. Asserting
+    a document on every refusal held only until a multi-document refusal was written.
+    """
     for item in load_golden_set():
-        if item.kind in ("document", "refusal"):
-            assert item.document_id, f"{item.id} is document-scoped but names no document"
+        if item.kind == "document":
+            assert item.document_id, f"{item.id} asks about one document but names none"
+        if item.kind == "cross_document":
+            assert not item.document_id, (
+                f"{item.id} spans documents; naming one scopes retrieval to it and the "
+                f"comparison it asks for cannot be made"
+            )
 
 
 def test_limit_truncates_the_golden_set() -> None:
