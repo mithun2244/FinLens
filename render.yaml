@@ -1,27 +1,29 @@
 # Render deployment for the FastAPI backend (api.py).
 #
 # Only the Python backend is described here. The Next.js app in frontend/ is a separate
-# service; see the CORS note below before deploying it.
+# service; set ALLOWED_ORIGINS below to its origin or the browser blocks every call it
+# makes.
 #
-# !! COST: this is NOT a free-tier configuration, which puts it in tension with rules.md
-#    Rule 1. Two things force it, both load-bearing rather than nice-to-have:
+# Free tier, deliberately — rules.md Rule 1. Two consequences to plan around rather than
+# discover in production:
 #
-#    RAM.  The free instance caps at 512 MB. This process holds torch, a Docling layout
-#          model and MiniLM resident — the lifespan hook loads them at boot precisely so
-#          the first request does not pay for it (api.py). It will not fit.
-#    DISK. Uploads, the Chroma store and the LLM cache all live under data/, and Render's
-#          filesystem is otherwise wiped on every deploy and restart. A disk requires a
-#          paid instance type.
-#
-#    Dropping to `plan: free` and deleting the `disk:` block will deploy, and will then
-#    OOM on model load or lose every indexed document on restart. That is a decision to
-#    make deliberately, not a default to inherit.
+#   RAM.  512 MB, against a process that holds torch, a Docling layout model and MiniLM
+#         resident. api.py's lifespan hook loads all three at boot so the first request
+#         does not pay for it, which means the ceiling is hit during startup rather than
+#         under load. If the service dies while booting with no error of its own, this is
+#         the reason. The ways out are a larger instance, or deferring the model load and
+#         accepting a slow first request.
+#   DATA. No disk, so data/ is ephemeral. Uploads, the Chroma store and the LLM cache are
+#         wiped on every deploy and every restart — and a free instance spins down after
+#         inactivity, so restarts are routine, not rare. Documents have to be re-uploaded
+#         after each one, and the ~500 MB of Docling and MiniLM weights are re-downloaded
+#         on every cold boot.
 
 services:
   - type: web
     name: finlens-api
     runtime: python
-    plan: starter
+    plan: free
     region: oregon
 
     # torch is installed separately and first, from the CPU index. A plain
@@ -62,15 +64,3 @@ services:
         value: "false"
       - key: LANGCHAIN_API_KEY
         sync: false
-
-      # Docling and sentence-transformers cache their model weights here. Pointing it at
-      # the disk means the ~500 MB download happens once rather than on every deploy.
-      - key: HF_HOME
-        value: /opt/render/project/src/data/.cache/huggingface
-
-    # Mounted at the path src/config.py derives for DATA_DIR: PROJECT_ROOT/data, where
-    # PROJECT_ROOT is the repo root and Render clones the repo to /opt/render/project/src.
-    disk:
-      name: finlens-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 5
