@@ -142,6 +142,12 @@ class GoldenItem:
     question: str
     reference: str
     document_id: str | None = None
+    #: Policy chunks to reserve in the judge's context, overriding the default for this
+    #: item's kind (:data:`POLICY_SLOTS`). Set it when an item's evidence does not look
+    #: like its kind's: q24 is ``cross_document`` but compares two invoice totals and
+    #: cites no policy, so the two slots its kind grants are chunks that cannot be
+    #: relevant — and context_precision counts every one of those against the answer.
+    policy_slots: int | None = None
 
 
 @dataclass
@@ -211,6 +217,13 @@ def load_golden_set(
         raw = json.loads(line)
         if wanted is not None and raw["kind"] not in wanted:
             continue
+        slots = raw.get("policy_slots")
+        if slots is not None and not 0 <= slots <= MAX_CONTEXTS:
+            # A typo here silently mis-scores an item, which is the class of bug this
+            # suite exists to catch — so it fails loudly instead.
+            raise AssistantError(
+                f"{raw['id']}: policy_slots must be between 0 and {MAX_CONTEXTS}, got {slots}."
+            )
         items.append(
             GoldenItem(
                 id=raw["id"],
@@ -218,6 +231,7 @@ def load_golden_set(
                 question=raw["question"],
                 reference=raw["reference"],
                 document_id=raw.get("document_id"),
+                policy_slots=slots,
             )
         )
 
@@ -365,15 +379,16 @@ def _build_judge_embeddings() -> Any:
     return RagasHFEmbeddings(model=EMBEDDING_MODEL, device="cpu")
 
 
-#: Policy chunks reserved in the judge's context, per question kind. context_precision
-#: counts an irrelevant context against the score, so a fixed half-and-half split caps a
-#: policy question near 0.5 — two invoice chunks that cannot be relevant to it by
-#: construction — and conversely starves a document question of two slots it needs.
+#: Default policy chunks reserved in the judge's context, per question kind, overridable
+#: per item via ``GoldenItem.policy_slots``. context_precision counts an irrelevant context
+#: against the score, so a fixed half-and-half split caps a policy question near 0.5 — two
+#: invoice chunks that cannot be relevant to it by construction — and conversely starves a
+#: document question of two slots it needs.
 #:
-#: ``cross_document`` genuinely wants both and is not a compromise: q23 asks how the NAT
-#: Gateway charge moved between two invoices *and whether it breaches the policy
-#: threshold*, so its evidence is two figures from the documents and one line from the
-#: policy corpus. Scoring it against either collection alone marks a correct answer wrong.
+#: ``cross_document`` defaults to both, which q23 needs and q24 does not: q23 asks how the
+#: NAT Gateway charge moved between two invoices *and whether it breaches the policy
+#: threshold*, while q24 compares two invoice totals and cites no policy at all. Kind is
+#: the right default and the wrong last word, which is what the per-item override is for.
 POLICY_SLOTS: dict[str, int] = {
     "policy": MAX_CONTEXTS,
     "cross_document": MAX_CONTEXTS // 2,
@@ -382,7 +397,7 @@ POLICY_SLOTS: dict[str, int] = {
 }
 
 
-def _judge_contexts(answer: Answer, kind: ItemKind) -> list[str]:
+def _judge_contexts(answer: Answer, item: GoldenItem) -> list[str]:
     """The trimmed retrieval set shown to the judge, weighted by what the question needs.
 
     What retrieval returned, NOT what the model cited (decision D-36). context_precision
@@ -398,15 +413,19 @@ def _judge_contexts(answer: Answer, kind: ItemKind) -> list[str]:
     spending cap follows from an EC2 bill, at 0.08 faithfulness, for answers that had
     cited ``travel_policy.md`` correctly.
 
-    Slots go to the collection holding the question's evidence (:data:`POLICY_SLOTS`) and
-    whatever is left over is filled from the other, so a short retrieval never wastes the
-    judge's budget on nothing.
+    Slots go to the collection holding the question's evidence — the item's own
+    ``policy_slots`` when it sets one, otherwise the default for its kind
+    (:data:`POLICY_SLOTS`) — and whatever is left over is filled from the other, so a short
+    retrieval never wastes the judge's budget on nothing.
     """
     policy = answer.retrieved_policy
     source = answer.retrieved or answer.citations
     documents = [citation for citation in source if citation not in policy]
 
-    chosen = policy[: POLICY_SLOTS.get(kind, 0)]
+    wanted = item.policy_slots
+    if wanted is None:
+        wanted = POLICY_SLOTS.get(item.kind, 0)
+    chosen = policy[:wanted]
     for pool in (documents, policy):
         chosen += [c for c in pool if c not in chosen][: MAX_CONTEXTS - len(chosen)]
     return [citation.snippet[:MAX_CONTEXT_CHARS] for citation in chosen] or [
@@ -422,7 +441,7 @@ async def _score_item(
     if answer is None:
         return
 
-    contexts = _judge_contexts(answer, result.item.kind)
+    contexts = _judge_contexts(answer, result.item)
     question, reference = result.item.question, result.item.reference
 
     async def safe(name: str, factory: Any) -> float | None:

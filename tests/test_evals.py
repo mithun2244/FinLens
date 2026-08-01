@@ -16,7 +16,7 @@ from decimal import Decimal
 
 import pytest
 
-from src import RateLimitError
+from src import AssistantError, RateLimitError
 from src.config import CHUNK_SIZE, EVALS_DIR, GOLDEN_SET_PATH
 from src.evals import (
     GROQ_OPENAI_BASE_URL,
@@ -82,6 +82,16 @@ def _cite(name: str, index: int) -> Citation:
     )
 
 
+def _item(kind: str, *, policy_slots: int | None = None) -> GoldenItem:
+    return GoldenItem(
+        id="x",
+        kind=kind,  # type: ignore[arg-type]
+        question="q",
+        reference="r",
+        policy_slots=policy_slots,
+    )
+
+
 def _dual_retrieval_answer(*, documents: int = 6, policies: int = 4) -> Answer:
     """An answer shaped like the real thing: document hits first, policy hits appended."""
     document_hits = [_cite("invoice", i) for i in range(documents)]
@@ -103,7 +113,7 @@ def test_judge_sees_policy_context_despite_the_trim() -> None:
     answers that cited the policy correctly — because the trim took the head of a
     document-first concatenation.
     """
-    contexts = _judge_contexts(_dual_retrieval_answer(), "policy")
+    contexts = _judge_contexts(_dual_retrieval_answer(), _item("policy"))
     assert len(contexts) == MAX_CONTEXTS
     assert any(c.startswith("travel_policy") for c in contexts), contexts
 
@@ -114,12 +124,12 @@ def test_policy_questions_are_not_charged_for_irrelevant_invoices() -> None:
     A fixed half-and-half split caps a policy question near 0.5 on chunks that cannot be
     relevant to it, which is what held the policy slice at 0.35 precision.
     """
-    contexts = _judge_contexts(_dual_retrieval_answer(), "policy")
+    contexts = _judge_contexts(_dual_retrieval_answer(), _item("policy"))
     assert all(c.startswith("travel_policy") for c in contexts), contexts
 
 
 def test_document_questions_are_not_charged_for_irrelevant_policies() -> None:
-    contexts = _judge_contexts(_dual_retrieval_answer(), "document")
+    contexts = _judge_contexts(_dual_retrieval_answer(), _item("document"))
     assert all(c.startswith("invoice") for c in contexts), contexts
 
 
@@ -128,20 +138,65 @@ def test_cross_document_questions_see_both_collections() -> None:
 
     Scoring it against either collection alone marks a correct answer wrong.
     """
-    contexts = _judge_contexts(_dual_retrieval_answer(), "cross_document")
+    contexts = _judge_contexts(_dual_retrieval_answer(), _item("cross_document"))
     assert any(c.startswith("travel_policy") for c in contexts), contexts
     assert any(c.startswith("invoice") for c in contexts), contexts
 
 
+def test_an_item_can_override_its_kind_default() -> None:
+    """q24 is cross_document but compares two invoice totals and cites no policy.
+
+    Its kind grants two policy slots that cannot be relevant to it, and context_precision
+    charges the answer for every one — which is what scored it 0.00.
+    """
+    contexts = _judge_contexts(_dual_retrieval_answer(), _item("cross_document", policy_slots=0))
+    assert all(c.startswith("invoice") for c in contexts), contexts
+
+
+def test_an_override_of_zero_is_not_mistaken_for_unset() -> None:
+    """``policy_slots=0`` and ``policy_slots=None`` mean opposite things on this kind."""
+    default = _judge_contexts(_dual_retrieval_answer(), _item("cross_document"))
+    overridden = _judge_contexts(
+        _dual_retrieval_answer(), _item("cross_document", policy_slots=0)
+    )
+    assert any(c.startswith("travel_policy") for c in default), default
+    assert not any(c.startswith("travel_policy") for c in overridden), overridden
+
+
+def test_q24_is_annotated_so_its_policy_slots_are_not_wasted() -> None:
+    """Pins the annotation itself: the code path is useless if the data never sets it."""
+    q24 = next(item for item in load_golden_set() if item.id == "q24")
+    assert q24.policy_slots == 0
+
+
+def test_an_out_of_range_override_is_rejected(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A typo here silently mis-scores an item, so it must fail loudly."""
+    path = tmp_path / "golden.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "q99",
+                "kind": "policy",
+                "question": "q",
+                "reference": "r",
+                "policy_slots": MAX_CONTEXTS + 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssistantError, match="policy_slots"):
+        load_golden_set(path=path)
+
+
 def test_judge_contexts_never_duplicate_when_documents_are_missing() -> None:
     """A policy-only retrieval must not have its policy hits counted twice."""
-    contexts = _judge_contexts(_dual_retrieval_answer(documents=0), "cross_document")
+    contexts = _judge_contexts(_dual_retrieval_answer(documents=0), _item("cross_document"))
     assert len(contexts) == len(set(contexts)), contexts
 
 
 def test_short_retrieval_tops_up_from_the_other_collection() -> None:
     """An unfilled quota must not waste the judge's budget on nothing."""
-    contexts = _judge_contexts(_dual_retrieval_answer(policies=1), "policy")
+    contexts = _judge_contexts(_dual_retrieval_answer(policies=1), _item("policy"))
     assert len(contexts) == MAX_CONTEXTS, contexts
     assert sum(c.startswith("travel_policy") for c in contexts) == 1, contexts
 
@@ -159,7 +214,7 @@ def test_judge_trim_clears_a_whole_chunk() -> None:
 
 def test_judge_contexts_fill_up_when_there_are_no_policy_hits() -> None:
     """No policy corpus is not a reason to show the judge less than it can afford."""
-    contexts = _judge_contexts(_dual_retrieval_answer(policies=0), "policy")
+    contexts = _judge_contexts(_dual_retrieval_answer(policies=0), _item("policy"))
     assert len(contexts) == MAX_CONTEXTS
     assert all(c.startswith("invoice") for c in contexts), contexts
 
