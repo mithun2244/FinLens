@@ -429,6 +429,13 @@ class Answer(_Base):
     #: snippets, a correct answer looks unfaithful because the supporting facts were never
     #: shown to the judge.
     retrieved: list[Citation] = Field(default_factory=list)
+    #: The policy-collection subset of :attr:`retrieved`, recorded separately because
+    #: ``retrieved`` is ordered document-hits-first (6 of them by default, against 4 policy
+    #: hits). Any head-slice of it therefore contains no policy text at all — which is how
+    #: the judge came to score "hotel spend is capped at 200 USD per night" against four
+    #: invoice line items and report 0.08 faithfulness on policy questions the pipeline had
+    #: cited correctly. Anything sampling a subset must draw from both.
+    retrieved_policy: list[Citation] = Field(default_factory=list)
     numeric_checks: list[NumericCheck] = Field(default_factory=list)
     model: str
     latency_seconds: float = Field(ge=0.0)
