@@ -17,12 +17,15 @@ from decimal import Decimal
 import pytest
 
 from src import RateLimitError
-from src.config import EVALS_DIR, GOLDEN_SET_PATH
+from src.config import CHUNK_SIZE, EVALS_DIR, GOLDEN_SET_PATH
 from src.evals import (
     GROQ_OPENAI_BASE_URL,
+    MAX_CONTEXTS,
+    MAX_CONTEXT_CHARS,
     TARGETS,
     GoldenItem,
     ItemResult,
+    _judge_contexts,
     _verdict,
     evaluate_answers,
     grounding_summary,
@@ -68,6 +71,97 @@ def _answer(
 def _result(kind: str, **kwargs: object) -> ItemResult:
     item = GoldenItem(id="x", kind=kind, question="q", reference="r")  # type: ignore[arg-type]
     return ItemResult(item=item, answer=_answer(**kwargs))  # type: ignore[arg-type]
+
+
+# ── Judge contexts ───────────────────────────────────────────────────────────
+
+
+def _cite(name: str, index: int) -> Citation:
+    return Citation(
+        document_id=name, filename=f"{name}.pdf", page=1, snippet=f"{name}-{index}", score=0.9
+    )
+
+
+def _dual_retrieval_answer(*, documents: int = 6, policies: int = 4) -> Answer:
+    """An answer shaped like the real thing: document hits first, policy hits appended."""
+    document_hits = [_cite("invoice", i) for i in range(documents)]
+    policy_hits = [_cite("travel_policy", i) for i in range(policies)]
+    return Answer(
+        question="What is the nightly hotel spending cap?",
+        text="t",
+        retrieved=document_hits + policy_hits,
+        retrieved_policy=policy_hits,
+        model="m",
+        latency_seconds=1.0,
+    )
+
+
+def test_judge_sees_policy_context_despite_the_trim() -> None:
+    """The bug this pins: ``retrieved[:MAX_CONTEXTS]`` is all document hits.
+
+    Policy questions were scored against invoice line items — 0.08 faithfulness for
+    answers that cited the policy correctly — because the trim took the head of a
+    document-first concatenation.
+    """
+    contexts = _judge_contexts(_dual_retrieval_answer(), "policy")
+    assert len(contexts) == MAX_CONTEXTS
+    assert any(c.startswith("travel_policy") for c in contexts), contexts
+
+
+def test_policy_questions_are_not_charged_for_irrelevant_invoices() -> None:
+    """context_precision counts an irrelevant context against the answer.
+
+    A fixed half-and-half split caps a policy question near 0.5 on chunks that cannot be
+    relevant to it, which is what held the policy slice at 0.35 precision.
+    """
+    contexts = _judge_contexts(_dual_retrieval_answer(), "policy")
+    assert all(c.startswith("travel_policy") for c in contexts), contexts
+
+
+def test_document_questions_are_not_charged_for_irrelevant_policies() -> None:
+    contexts = _judge_contexts(_dual_retrieval_answer(), "document")
+    assert all(c.startswith("invoice") for c in contexts), contexts
+
+
+def test_cross_document_questions_see_both_collections() -> None:
+    """q23 needs two invoice figures *and* the policy threshold it asks about.
+
+    Scoring it against either collection alone marks a correct answer wrong.
+    """
+    contexts = _judge_contexts(_dual_retrieval_answer(), "cross_document")
+    assert any(c.startswith("travel_policy") for c in contexts), contexts
+    assert any(c.startswith("invoice") for c in contexts), contexts
+
+
+def test_judge_contexts_never_duplicate_when_documents_are_missing() -> None:
+    """A policy-only retrieval must not have its policy hits counted twice."""
+    contexts = _judge_contexts(_dual_retrieval_answer(documents=0), "cross_document")
+    assert len(contexts) == len(set(contexts)), contexts
+
+
+def test_short_retrieval_tops_up_from_the_other_collection() -> None:
+    """An unfilled quota must not waste the judge's budget on nothing."""
+    contexts = _judge_contexts(_dual_retrieval_answer(policies=1), "policy")
+    assert len(contexts) == MAX_CONTEXTS, contexts
+    assert sum(c.startswith("travel_policy") for c in contexts) == 1, contexts
+
+
+def test_judge_trim_clears_a_whole_chunk() -> None:
+    """A trim below CHUNK_SIZE cuts the tail off chunks, which is where the rules live.
+
+    The policy corpus describes a topic and then closes with the number. At 500 chars this
+    removed the 30-day claim deadline, the USD 200 NAT alert threshold and the 60-day
+    dispute window from the judge's view, scoring 0.00 recall on chunks retrieval had
+    ranked 0th or 1st.
+    """
+    assert MAX_CONTEXT_CHARS >= CHUNK_SIZE
+
+
+def test_judge_contexts_fill_up_when_there_are_no_policy_hits() -> None:
+    """No policy corpus is not a reason to show the judge less than it can afford."""
+    contexts = _judge_contexts(_dual_retrieval_answer(policies=0), "policy")
+    assert len(contexts) == MAX_CONTEXTS
+    assert all(c.startswith("invoice") for c in contexts), contexts
 
 
 # ── Golden set integrity ─────────────────────────────────────────────────────

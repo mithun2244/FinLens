@@ -640,6 +640,7 @@ def stream_answer(
             text=text,
             citations=citations,
             retrieved=available,
+            retrieved_policy=policy_hits,
             numeric_checks=cross_check_numbers(text, record, available),
             dropped_citations=dropped,
             refused=_looks_like_refusal(text),

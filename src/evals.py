@@ -38,6 +38,7 @@ from typing import Any, Literal
 from src import AssistantError, RateLimitError
 from src.chain import answer_question
 from src.config import (
+    CHUNK_SIZE,
     COLLECTION_DOCUMENTS,
     COLLECTION_POLICIES,
     EMBEDDING_MODEL,
@@ -70,7 +71,15 @@ DEFAULT_PACE = 2.0
 #: model, and an untrimmed judge call requested ~1,745 — roughly three calls a minute.
 #: Cutting the context keeps the judge informed while letting a full run finish.
 MAX_CONTEXTS = 4
-MAX_CONTEXT_CHARS = 500
+
+#: One whole chunk, which is why it is CHUNK_SIZE rather than a number of its own: a trim
+#: below what the chunker emits decapitates chunks by construction. At 500 it truncated the
+#: *head* of chunks running 589-698 chars, and the policy corpus states its rules last —
+#: a section describes the topic, then closes with the number. The 30-day claim deadline,
+#: the USD 200 NAT alert threshold and the 60-day dispute window all sat past char 470 and
+#: were cut, so the judge scored answers against context with the answer removed and
+#: returned 0.00 recall for chunks retrieval had ranked 0th or 1st.
+MAX_CONTEXT_CHARS = CHUNK_SIZE
 
 #: How many times to retry a judge call that was rate limited.
 JUDGE_ATTEMPTS = 4
@@ -356,6 +365,55 @@ def _build_judge_embeddings() -> Any:
     return RagasHFEmbeddings(model=EMBEDDING_MODEL, device="cpu")
 
 
+#: Policy chunks reserved in the judge's context, per question kind. context_precision
+#: counts an irrelevant context against the score, so a fixed half-and-half split caps a
+#: policy question near 0.5 — two invoice chunks that cannot be relevant to it by
+#: construction — and conversely starves a document question of two slots it needs.
+#:
+#: ``cross_document`` genuinely wants both and is not a compromise: q23 asks how the NAT
+#: Gateway charge moved between two invoices *and whether it breaches the policy
+#: threshold*, so its evidence is two figures from the documents and one line from the
+#: policy corpus. Scoring it against either collection alone marks a correct answer wrong.
+POLICY_SLOTS: dict[str, int] = {
+    "policy": MAX_CONTEXTS,
+    "cross_document": MAX_CONTEXTS // 2,
+    "document": 0,
+    "refusal": 0,  # never scored — refusal items are excluded before scoring
+}
+
+
+def _judge_contexts(answer: Answer, kind: ItemKind) -> list[str]:
+    """The trimmed retrieval set shown to the judge, weighted by what the question needs.
+
+    What retrieval returned, NOT what the model cited (decision D-36). context_precision
+    and context_recall are retrieval metrics, and faithfulness judges the answer against
+    the context the model was given. Passing citations instead scored 0.077 precision and
+    0.15 faithfulness on a pipeline whose extraction is exactly right — an artefact of
+    showing the judge two snippets out of ten.
+
+    Still trimmed, because the free tier limits tokens per minute (D-27) — but trimmed
+    per collection rather than off the head of their concatenation. ``Answer.retrieved``
+    is document-hits-first, so ``retrieved[:4]`` showed the judge four invoice line items
+    and no policy text whatsoever: policy questions were scored on whether a hotel
+    spending cap follows from an EC2 bill, at 0.08 faithfulness, for answers that had
+    cited ``travel_policy.md`` correctly.
+
+    Slots go to the collection holding the question's evidence (:data:`POLICY_SLOTS`) and
+    whatever is left over is filled from the other, so a short retrieval never wastes the
+    judge's budget on nothing.
+    """
+    policy = answer.retrieved_policy
+    source = answer.retrieved or answer.citations
+    documents = [citation for citation in source if citation not in policy]
+
+    chosen = policy[: POLICY_SLOTS.get(kind, 0)]
+    for pool in (documents, policy):
+        chosen += [c for c in pool if c not in chosen][: MAX_CONTEXTS - len(chosen)]
+    return [citation.snippet[:MAX_CONTEXT_CHARS] for citation in chosen] or [
+        "(no context was retrieved)"
+    ]
+
+
 async def _score_item(
     result: ItemResult, metrics: dict[str, Any], *, pace: float = DEFAULT_PACE
 ) -> None:
@@ -364,19 +422,7 @@ async def _score_item(
     if answer is None:
         return
 
-    # What retrieval returned, NOT what the model cited (decision D-36).
-    #
-    # context_precision and context_recall are retrieval metrics, and faithfulness judges
-    # the answer against the context the model was given. Passing citations instead scored
-    # 0.077 precision and 0.15 faithfulness on a pipeline whose extraction is exactly
-    # right — an artefact of showing the judge two snippets out of ten.
-    #
-    # Still trimmed, because the free tier limits tokens per minute (D-27), but trimmed
-    # from the retrieval set rather than substituted for it.
-    source = answer.retrieved or answer.citations
-    contexts = [
-        citation.snippet[:MAX_CONTEXT_CHARS] for citation in source[:MAX_CONTEXTS]
-    ] or ["(no context was retrieved)"]
+    contexts = _judge_contexts(answer, result.item.kind)
     question, reference = result.item.question, result.item.reference
 
     async def safe(name: str, factory: Any) -> float | None:
