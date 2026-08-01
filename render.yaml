@@ -1,0 +1,70 @@
+# Render deployment for the FastAPI backend (api.py).
+#
+# Only the Python backend is described here. The Next.js app in frontend/ is a separate
+# service; see the CORS note below before deploying it.
+#
+# !! COST: this is NOT a free-tier configuration, which puts it in tension with rules.md
+#    Rule 1. Two things force it, both load-bearing rather than nice-to-have:
+#
+#    RAM.  The free instance caps at 512 MB. This process holds torch, a Docling layout
+#          model and MiniLM resident — the lifespan hook loads them at boot precisely so
+#          the first request does not pay for it (api.py). It will not fit.
+#    DISK. Uploads, the Chroma store and the LLM cache all live under data/, and Render's
+#          filesystem is otherwise wiped on every deploy and restart. A disk requires a
+#          paid instance type.
+#
+#    Dropping to `plan: free` and deleting the `disk:` block will deploy, and will then
+#    OOM on model load or lose every indexed document on restart. That is a decision to
+#    make deliberately, not a default to inherit.
+
+services:
+  - type: web
+    name: finlens-api
+    runtime: python
+    plan: starter
+    region: oregon
+
+    # torch is installed separately and first, from the CPU index. A plain
+    # `pip install torch` on Linux resolves to the CUDA build and drags in ~2.5 GB of
+    # libraries this CPU-only service will never call — requirements.txt carries the same
+    # instruction for local installs, and the build fails on size without it.
+    buildCommand: |
+      pip install --upgrade pip
+      pip install torch --index-url https://download.pytorch.org/whl/cpu
+      pip install -r requirements.txt
+
+    # Single worker, deliberately. api.py keeps parsed documents in an in-process dict, so
+    # a second worker would hold its own copy and uploads would appear to vanish between
+    # requests; the embedded Chroma store is single-process regardless (decision D-34).
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1
+
+    # Returns degraded rather than failing when Groq is unreachable, so it answers during
+    # a provider outage instead of pulling the service out of rotation.
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+      # Required. Free tier, no credit card. sync:false keeps it out of the repo — set it
+      # in the Render dashboard.
+      - key: GROQ_API_KEY
+        sync: false
+
+      # Optional tracing. The app runs normally without these (decision D-11).
+      - key: LANGCHAIN_TRACING_V2
+        value: "false"
+      - key: LANGCHAIN_API_KEY
+        sync: false
+
+      # Docling and sentence-transformers cache their model weights here. Pointing it at
+      # the disk means the ~500 MB download happens once rather than on every deploy.
+      - key: HF_HOME
+        value: /opt/render/project/src/data/.cache/huggingface
+
+    # Mounted at the path src/config.py derives for DATA_DIR: PROJECT_ROOT/data, where
+    # PROJECT_ROOT is the repo root and Render clones the repo to /opt/render/project/src.
+    disk:
+      name: finlens-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 5
