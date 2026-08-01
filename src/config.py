@@ -201,6 +201,14 @@ class Settings(BaseSettings):
     langchain_api_key: str = ""
     langchain_project: str = "multimodal-fin-assistant"
 
+    # Deployment — browser origins allowed to call the API (CORS).
+    #
+    # Anywhere but local development the frontend is served from a different host, and a
+    # different host is a different origin, so this must be set wherever the API is
+    # deployed or the browser blocks every call. Comma-separated rather than a JSON list
+    # because it gets typed into a hosting dashboard by hand.
+    allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
     # Behavior.
     text_yield_threshold: float = Field(
         default=0.15,
@@ -224,10 +232,39 @@ class Settings(BaseSettings):
     def _strip_key(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("allowed_origins")
+    @classmethod
+    def _reject_wildcard_origin(cls, value: str) -> str:
+        """A wildcard here is a vulnerability rather than a convenience.
+
+        The API is mounted with ``allow_credentials=True``. Starlette answers a wildcard
+        under that setting by echoing the caller's own origin back in
+        ``Access-Control-Allow-Origin``, which is not the harmless "public API" behaviour
+        the ``*`` suggests: it means any site a user has open can make credentialed
+        requests to this one and read the replies. Enumerating origins is the only safe
+        form, so a wildcard fails at startup instead of surviving to an audit.
+        """
+        if "*" in value:
+            raise ValueError(
+                "allowed_origins cannot contain '*'. This API sends credentials, and a "
+                "wildcard combined with credentials lets any site call it on a signed-in "
+                "user's behalf. List the frontend origins explicitly, comma-separated."
+            )
+        return value.strip()
+
     @property
     def groq_configured(self) -> bool:
         """True when a Groq key is present. Cloud reasoning is unavailable without it."""
         return bool(self.groq_api_key) and self.groq_api_key != "gsk_your_key_here"
+
+    @property
+    def allowed_origin_list(self) -> list[str]:
+        """``allowed_origins`` as CORSMiddleware wants it, with blanks dropped.
+
+        Blanks are dropped because a trailing comma in a dashboard field is easy to leave
+        behind, and an empty string is an origin that matches nothing while looking set.
+        """
+        return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
 
     @property
     def tracing_enabled(self) -> bool:

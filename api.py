@@ -48,6 +48,7 @@ from src.config import (  # noqa: E402
     SUPPORTED_EXTENSIONS,
     configure_logging,
     ensure_directories,
+    get_settings,
 )
 from src.extractor import extract_record  # noqa: E402
 from src.llm import llm_available  # noqa: E402
@@ -63,10 +64,11 @@ from src.vectorstore import warm_up as warm_embeddings  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+#: Browser origins allowed to call this API, from ``ALLOWED_ORIGINS`` in the environment.
+#: Defaults to the local Next.js dev server; a deployed frontend is a different origin and
+#: is blocked until it is listed. See :class:`src.config.Settings` for why a wildcard is
+#: rejected rather than supported.
+ALLOWED_ORIGINS = get_settings().allowed_origin_list
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
