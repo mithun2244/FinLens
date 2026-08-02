@@ -14,7 +14,10 @@ import type {
   HealthPayload,
   SampleDocument,
 } from "@/lib/api";
-import { fetchHealth, fetchSamples } from "@/lib/api";
+import { API_BASE, fetchHealth, fetchSamples } from "@/lib/api";
+
+/** Whether the configured API is a local dev server, which changes the offline advice. */
+const isLocalApi = /^https?:\/\/(localhost|127\.0\.0\.1)/.test(API_BASE);
 
 export default function Home() {
   const [document, setDocument] = useState<FinancialDocument | null>(null);
@@ -86,9 +89,19 @@ export default function Home() {
         {offline && (
           <div className="relative z-10 mx-10 mb-4 rounded-xl border-l-2 border-state-bad bg-state-bad/10 px-4 py-3 text-[12px] font-light leading-relaxed text-state-bad">
             Cannot reach the FinLens API at{" "}
-            <span className="font-mono">http://localhost:8000</span>. Start it with{" "}
-            <span className="font-mono">uvicorn api:app --port 8000</span> from the
-            project root.
+            {/* The real base, not a hardcoded localhost. This build may be pointed at a
+                deployed API through NEXT_PUBLIC_API_BASE, and naming the wrong host sends
+                someone to restart a server that was never the problem. */}
+            <span className="break-all font-mono">{API_BASE}</span>
+            {isLocalApi ? (
+              <>
+                . Start it with{" "}
+                <span className="font-mono">uvicorn api:app --port 8000</span> from the
+                project root.
+              </>
+            ) : (
+              <>. It may be waking from idle — retry in a moment.</>
+            )}
           </div>
         )}
 
