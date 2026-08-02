@@ -246,7 +246,6 @@ FIXTURE_IDS: tuple[tuple[str, str], ...] = (
     ("clean_invoice.pdf", "aws-current"),
     ("prior_invoice.pdf", "aws-prior"),
     ("multipage_statement.pdf", "statement"),
-    ("scanned_receipt.png", "receipt"),
     ("unbalanced_invoice.pdf", "northwind"),
 )
 

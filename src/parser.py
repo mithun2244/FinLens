@@ -1,16 +1,21 @@
 """Document ingestion and layout parsing (phases.md Phase 2).
 
-Turns a PDF or image into a :class:`~src.schemas.ParsedDocument`: page-level text, tables
-with their row structure intact, rendered page images for the previewer, and normalized
+Turns a PDF into a :class:`~src.schemas.ParsedDocument`: page-level text, tables with
+their row structure intact, rendered page images for the previewer, and normalized
 bounding boxes for citation highlighting.
 
-Two behaviours are worth knowing before reading the code:
+Three behaviours are worth knowing before reading the code:
 
-**Docling is the primary path; OCR is a fallback** (decisions D-1, D-15). A digital PDF is
-parsed from its text layer, which is deterministic and fast. Only pages whose
-``text_yield_ratio`` says they have no usable text layer are re-parsed through Docling's
-**local** RapidOCR engine. Nothing here calls a cloud model — Groq serves no image-input
-model, and page images never leave the machine.
+**pdfplumber reads the text layer; there is no OCR** (revises decisions D-1, D-15). This
+used to run Docling, whose TableFormer model recovered tables from unruled layouts and
+whose RapidOCR fallback read scanned pages. Both are torch or onnxruntime models, and
+neither fits in a 512 MB deployment. What replaced them reads ruled and whitespace-aligned
+tables from the PDF's own text layer, which is what the fixture invoices actually use.
+
+**A PDF with no text layer is now an error, not a fallback.** Nothing here can read a
+picture of a document. Rejecting it is the only honest option: a scanned invoice parsed
+without OCR yields no line items and no total, which is indistinguishable from a
+successful parse of an empty document.
 
 **Nothing is ever invented.** If a page cannot be read, that fact propagates as a
 ``ParsingError`` or a zero text yield. The parser never substitutes a plausible value
@@ -25,30 +30,24 @@ import shutil
 import time
 import uuid
 from collections import OrderedDict
-from functools import lru_cache
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from src import ParsingError
 from src.config import (
-    DOCLING_IMAGE_SCALE,
-    DOCLING_NUM_THREADS,
     EXPECTED_CHARS_PER_PAGE,
     IMAGE_EXTENSIONS,
     MAX_UPLOAD_BYTES,
     MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER,
-    OCR_LANGUAGES,
-    OCR_TEXT_SCORE,
+    MIN_COLUMN_GUTTER,
+    PAGE_RENDER_DPI,
     PARSE_CACHE_SIZE,
     SUPPORTED_EXTENSIONS,
-    TABLE_MODE_ACCURATE,
+    TABLE_STRATEGIES,
     UPLOAD_DIR,
-    get_settings,
 )
 from src.schemas import BoundingBox, ParsedDocument, ParsedPage, TableBlock
-
-if TYPE_CHECKING:
-    from docling.datamodel.document import ConversionResult
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +63,9 @@ __all__ = [
 
 # ── Fast-path triage and result cache ────────────────────────────────────────
 
-#: Parsed documents keyed by (content hash, ocr flag). Re-uploading a file already parsed
-#: in this process returns immediately instead of re-running the layout models.
-_PARSE_CACHE: OrderedDict[tuple[str, bool], ParsedDocument] = OrderedDict()
+#: Parsed documents keyed by content hash. Re-uploading a file already parsed in this
+#: process returns immediately instead of re-reading it.
+_PARSE_CACHE: OrderedDict[str, ParsedDocument] = OrderedDict()
 
 
 def _content_hash(path: Path) -> str:
@@ -79,21 +78,20 @@ def _content_hash(path: Path) -> str:
 
 
 def has_text_layer(path: Path) -> tuple[bool, int, int]:
-    """Cheaply decide whether a PDF already carries extractable text.
+    """Decide whether a PDF carries extractable text.
 
-    Runs PyMuPDF over the file — 1-10 ms against Docling's seconds — purely to choose the
-    right pipeline up front. Without it, a scanned PDF is parsed **twice**: once to
-    discover the text yield is too low, then again with OCR enabled.
+    Runs PyMuPDF, which answers in 1-10 ms. This used to choose between the text and OCR
+    pipelines; now it decides whether the document is readable at all, so its answer is
+    the difference between a parse and a rejection.
 
-    This is triage only. The extracted text is deliberately discarded: PyMuPDF returns a
-    flat character stream with no table structure, and line items come from Docling's
-    TableFormer rows (decision D-7). Substituting raw text here would make every invoice
-    fall back to narrative pattern-matching at 0.55 confidence and cost the line-item
-    recall the product is built on.
+    The extracted text is still discarded rather than used: PyMuPDF returns a flat
+    character stream with no table structure, and line items come from table rows
+    (decision D-7). Substituting raw text here would make every invoice fall back to
+    narrative pattern-matching at 0.55 confidence.
 
     Returns:
         ``(has_text, page_count, total_chars)``. ``has_text`` is ``False`` for images and
-        for anything PyMuPDF cannot open, so the caller falls back to OCR.
+        for anything PyMuPDF cannot open.
     """
     if path.suffix.lower() in IMAGE_EXTENSIONS:
         return False, 1, 0
@@ -101,7 +99,7 @@ def has_text_layer(path: Path) -> tuple[bool, int, int]:
     try:
         import fitz
     except ImportError:  # pragma: no cover - PyMuPDF is a declared dependency
-        logger.debug("PyMuPDF unavailable; skipping fast-path triage")
+        logger.debug("PyMuPDF unavailable; skipping triage")
         return True, 0, 0
 
     try:
@@ -109,7 +107,7 @@ def has_text_layer(path: Path) -> tuple[bool, int, int]:
             pages = document.page_count or 1
             chars = sum(len(page.get_text("text") or "") for page in document)
     except Exception as exc:  # noqa: BLE001 - triage must never block parsing
-        logger.debug("Triage could not read %s (%s); deferring to Docling", path.name, exc)
+        logger.debug("Triage could not read %s (%s); deferring to the parser", path.name, exc)
         return True, 0, 0
 
     per_page = chars / max(1, pages)
@@ -126,74 +124,16 @@ def clear_parse_cache() -> None:
     _PARSE_CACHE.clear()
 
 
-# ── Converter construction (expensive — built once, cached) ───────────────────
-
-
-@lru_cache(maxsize=2)
-def _get_converter(with_ocr: bool) -> Any:
-    """Return a cached :class:`DocumentConverter`, with or without the OCR stage.
-
-    Building a converter loads Docling's layout and TableFormer models, which takes
-    ~15-20 s. Caching is not an optimization here — without it, every upload would pay
-    that cost and blow NFR-2 (< 8 s per text page) on its own.
-    """
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import (
-        AcceleratorDevice,
-        AcceleratorOptions,
-        PdfPipelineOptions,
-        RapidOcrOptions,
-        TableFormerMode,
-        TableStructureOptions,
-    )
-    from docling.document_converter import (
-        DocumentConverter,
-        ImageFormatOption,
-        PdfFormatOption,
-    )
-
-    options = PdfPipelineOptions()
-    # Docling defaults to 4 threads and sets torch's thread count itself, so this must be
-    # configured here — torch.set_num_threads() from application code is overridden and
-    # has no effect. Worth 42% of parse time on a 12-core machine (config.py).
-    options.accelerator_options = AcceleratorOptions(
-        num_threads=DOCLING_NUM_THREADS, device=AcceleratorDevice.CPU
-    )
-    options.do_ocr = with_ocr
-    options.do_table_structure = True
-    # Assigned as a whole rather than mutated field-by-field: the attribute is declared as
-    # BaseTableStructureOptions, which has neither `mode` nor `do_cell_matching`.
-    options.table_structure_options = TableStructureOptions(
-        mode=TableFormerMode.ACCURATE if TABLE_MODE_ACCURATE else TableFormerMode.FAST,
-        do_cell_matching=True,
-    )
-    options.generate_page_images = True
-    options.images_scale = DOCLING_IMAGE_SCALE
-
-    if with_ocr:
-        options.ocr_options = RapidOcrOptions(
-            lang=list(OCR_LANGUAGES),
-            text_score=OCR_TEXT_SCORE,
-            force_full_page_ocr=True,
-        )
-
-    logger.info("Building Docling converter (ocr=%s)", with_ocr)
-    return DocumentConverter(
-        allowed_formats=[InputFormat.PDF, InputFormat.IMAGE],
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=options),
-            InputFormat.IMAGE: ImageFormatOption(pipeline_options=options),
-        },
-    )
-
-
 def warm_up(with_ocr: bool = False) -> None:
-    """Pre-load Docling's models so the first real upload is not the slow one.
+    """Import the parsing libraries so the first upload does not pay for it.
 
-    Call this at application start (Phase 5) rather than making the user pay ~20 s on
-    their first document.
+    Kept, and kept cheap. Under Docling this loaded layout and TableFormer models and cost
+    ~9 s; pdfplumber and PyMuPDF have no models, so this is just an import. The signature
+    keeps ``with_ocr`` so existing callers do not break — it is ignored, and there is no
+    OCR stage left to enable.
     """
-    _get_converter(with_ocr)
+    import pdfplumber  # noqa: F401
+    import fitz  # noqa: F401
 
 
 # ── Input validation ─────────────────────────────────────────────────────────
@@ -207,6 +147,15 @@ def _validate_source(path: Path) -> None:
         raise ParsingError(f"{path.name} is a directory, not a document.")
 
     suffix = path.suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        # Named separately from the generic case: "images are not supported" is actionable
+        # in a way that "supported formats: .pdf" is not, when the user just uploaded a
+        # photo of a receipt and reasonably expected it to work.
+        raise ParsingError(
+            f"{path.name} is an image, and image and scanned-document support was removed "
+            f"when OCR was dropped to fit the memory budget. Upload a PDF with a text "
+            f"layer — a print-to-PDF or the original download rather than a photo."
+        )
     if suffix not in SUPPORTED_EXTENSIONS:
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         raise ParsingError(
@@ -223,36 +172,15 @@ def _validate_source(path: Path) -> None:
         )
 
 
-def _convert(path: Path, with_ocr: bool) -> ConversionResult:
-    """Run Docling, translating its failures into actionable ``ParsingError``s."""
-    from docling.datamodel.base_models import ConversionStatus
-    from docling.exceptions import ConversionError
-
-    try:
-        result = _get_converter(with_ocr).convert(path)
-    except ConversionError as exc:
-        raise ParsingError(_explain_conversion_failure(path, str(exc))) from exc
-    except (OSError, ValueError) as exc:
-        raise ParsingError(f"Could not read {path.name}: {exc}") from exc
-
-    if result.status == ConversionStatus.FAILURE:
-        raise ParsingError(_explain_conversion_failure(path, str(result.errors)))
-    if result.status == ConversionStatus.PARTIAL_SUCCESS:
-        logger.warning("Partial conversion for %s — some pages may be incomplete", path.name)
-    return result
-
-
-def _explain_conversion_failure(path: Path, detail: str) -> str:
+def _explain_open_failure(path: Path, detail: str) -> str:
     """Turn a library error into something a user can act on (rules.md Rule 2.3)."""
     lowered = detail.lower()
     if "password" in lowered or "encrypt" in lowered:
+        return f"{path.name} is password-protected. Remove the password and upload it again."
+    if "not a pdf" in lowered or "no /root" in lowered or "startxref" in lowered:
         return (
-            f"{path.name} is password-protected. Remove the password and upload it again."
-        )
-    if "data format error" in lowered or "could not load" in lowered:
-        return (
-            f"{path.name} appears to be corrupt or is not a valid "
-            f"{path.suffix.lstrip('.').upper()} file. Try re-exporting or re-downloading it."
+            f"{path.name} appears to be corrupt or is not a valid PDF. "
+            f"Try re-exporting or re-downloading it."
         )
     return f"Could not parse {path.name}. The file may be damaged or in an unsupported variant."
 
@@ -260,135 +188,277 @@ def _explain_conversion_failure(path: Path, detail: str) -> str:
 # ── Geometry ─────────────────────────────────────────────────────────────────
 
 
-def _normalize_bbox(bbox: Any, width: float, height: float) -> BoundingBox | None:
-    """Convert a Docling bbox to 0-1, **top-left origin** coordinates.
+def _normalize_bbox(
+    bbox: tuple[float, float, float, float] | None, width: float, height: float
+) -> BoundingBox | None:
+    """Convert a pdfplumber bbox to 0-1, top-left origin coordinates.
 
-    Docling reports absolute points with ``CoordOrigin.BOTTOMLEFT``, where ``t`` is the
-    larger y value. CSS wants top-left with y growing downward, so bottom-left boxes are
-    flipped here — once, at the boundary — rather than in the UI (decision D-16).
+    pdfplumber reports ``(x0, top, x1, bottom)`` in points, already measured from the top
+    of the page — so unlike Docling's bottom-left boxes there is no flip here, only a
+    scale. The clamping stays: a table border drawn a hair outside the mediabox would
+    otherwise produce a value above 1.0 and fail ``BoundingBox`` validation.
     """
     if bbox is None or width <= 0 or height <= 0:
         return None
 
     try:
-        left, right = float(bbox.l), float(bbox.r)
-        top_raw, bottom_raw = float(bbox.t), float(bbox.b)
-    except (AttributeError, TypeError, ValueError):
+        left, top, right, bottom = (float(value) for value in bbox)
+    except (TypeError, ValueError):
         return None
-
-    origin = getattr(getattr(bbox, "coord_origin", None), "value", "")
-    if str(origin).upper() == "BOTTOMLEFT":
-        top, bottom = height - top_raw, height - bottom_raw
-    else:
-        top, bottom = top_raw, bottom_raw
-
-    if top > bottom:
-        top, bottom = bottom, top
-    if left > right:
-        left, right = right, left
 
     def clamp(value: float, limit: float) -> float:
         return max(0.0, min(1.0, value / limit))
 
-    return BoundingBox(
+    normalized = BoundingBox(
         left=clamp(left, width),
         top=clamp(top, height),
         right=clamp(right, width),
         bottom=clamp(bottom, height),
     )
+    # A zero-area box highlights nothing and is worse than no box at all, because the UI
+    # renders it as an invisible overlay rather than falling back to page-level highlight.
+    if normalized.width <= 0 or normalized.height <= 0:
+        return None
+    return normalized
 
 
-def _item_page_and_bbox(item: Any, pages: dict[int, tuple[float, float]]) -> tuple[int | None, BoundingBox | None]:
-    """Read ``page_no`` and a normalized bbox off any provenance-carrying Docling item."""
-    provenance = getattr(item, "prov", None)
-    if not provenance:
-        return None, None
-
-    first = provenance[0]
-    page_no = getattr(first, "page_no", None)
-    if page_no is None:
-        return None, None
-
-    width, height = pages.get(int(page_no), (0.0, 0.0))
-    return int(page_no), _normalize_bbox(getattr(first, "bbox", None), width, height)
+# ── Extraction ───────────────────────────────────────────────────────────────
 
 
-# ── Extraction helpers ───────────────────────────────────────────────────────
+def _clean_cell(value: Any) -> str:
+    """Table cells come back as ``str | None``, often with wrapped-line newlines."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
 
 
-def _page_dimensions(document: Any) -> dict[int, tuple[float, float]]:
-    dimensions: dict[int, tuple[float, float]] = {}
-    for page_no, page in document.pages.items():
-        size = getattr(page, "size", None)
-        dimensions[int(page_no)] = (
-            float(getattr(size, "width", 0.0) or 0.0),
-            float(getattr(size, "height", 0.0) or 0.0),
-        )
-    return dimensions
+def _looks_numeric(cell: str) -> bool:
+    """True when a cell is a bare number or amount, ignoring currency noise."""
+    stripped = cell.replace(",", "").replace("$", "").replace("£", "").replace("€", "").strip()
+    if not stripped:
+        return False
+    try:
+        Decimal(stripped)
+    except InvalidOperation:
+        return False
+    return True
 
 
-def _extract_tables(document: Any, pages: dict[int, tuple[float, float]]) -> list[TableBlock]:
-    """Pull each detected table out with its rows intact.
+def _is_probable_header(row: list[str]) -> bool:
+    """Whether a row reads as column headers rather than data.
 
-    Row structure is the reason Docling was chosen over pdfplumber or PyPDF2
-    (architecture.md §3.2). A table that arrives here as flattened text is a parse
-    failure even when nothing raised.
+    A table continued onto a second page repeats no header — the statement fixture's page
+    2 starts straight at "GITHUB INC | 1 | 21.00 | 21.00". Taking the first row as headers
+    regardless silently ate that line item and named the columns after it, so the page
+    contributed one row instead of two and the document totalled 3 items instead of 5.
+
+    Amounts are the discriminator: column headers do not contain bare numbers, and every
+    continuation row does.
     """
-    blocks: list[TableBlock] = []
+    cells = [cell for cell in row if cell]
+    return bool(cells) and not any(_looks_numeric(cell) for cell in cells)
 
-    for index, table in enumerate(getattr(document, "tables", [])):
-        page_no, bbox = _item_page_and_bbox(table, pages)
-        try:
-            frame = table.export_to_dataframe(document)
-        except (TypeError, AttributeError):
-            frame = table.export_to_dataframe()
-        except Exception as exc:  # noqa: BLE001 - a bad table must not sink the document
-            logger.warning("Table %d could not be exported: %s", index, type(exc).__name__)
+
+def _table_from_rows(
+    raw_rows: list[list[Any]],
+    page_number: int,
+    bbox: BoundingBox | None,
+    inherited_headers: list[str] | None = None,
+) -> TableBlock | None:
+    """Turn pdfplumber's list-of-lists into a :class:`TableBlock`.
+
+    The first non-empty row is taken as the header. That is a heuristic, and it is the
+    same one Docling's output effectively encoded — ``_map_columns`` in the extractor is
+    what actually decides whether the headers mean anything, and a table whose headers do
+    not map to description/amount is skipped there rather than here.
+    """
+    rows = [[_clean_cell(cell) for cell in row] for row in raw_rows if row]
+    rows = [row for row in rows if any(cell for cell in row)]
+    if not rows:
+        return None
+
+    if _is_probable_header(rows[0]):
+        header_row, data_rows = rows[0], rows[1:]
+    elif inherited_headers:
+        # A continuation table: every row is data, and the columns are the ones the table
+        # was introduced with on an earlier page.
+        header_row, data_rows = list(inherited_headers), rows
+    else:
+        return None
+
+    if not data_rows:
+        return None
+
+    groups = _column_groups(header_row)
+    if not groups:
+        return None
+
+    headers = [header_row[group[0]] or f"column_{group[0] + 1}" for group in groups]
+    body: list[dict[str, str]] = []
+    for row in data_rows:
+        merged = [
+            " ".join(part for part in (row[i] if i < len(row) else "" for i in group) if part)
+            for group in groups
+        ]
+        # A row with nothing in its first column is a totals block, not a line item: the
+        # horizontal rule under the last item opens one more band, and the Subtotal/Tax
+        # figures fall into it as ``['', '', '', '462.00 39.27']``. Kept out of the table
+        # because it would otherwise become a table_row chunk of bare numbers with no
+        # description — retrieval noise, and a row that D-7's "one chunk per row" promise
+        # was never about. The figures themselves are not lost; they are read from the
+        # narrative text by the extractor and carried in the record summary chunk.
+        if not merged or not merged[0]:
             continue
+        body.append(dict(zip(headers, merged)))
 
-        if frame is None or frame.empty:
-            continue
+    if not body:
+        return None
+    return TableBlock(page_number=page_number, headers=headers, rows=body, bbox=bbox)
 
-        headers = [str(column).strip() for column in frame.columns]
-        rows: list[dict[str, str]] = []
-        for record in frame.to_dict(orient="records"):
-            row = {
-                str(key).strip(): ("" if value is None else str(value).strip())
-                for key, value in record.items()
-            }
-            if any(row.values()):
-                rows.append(row)
 
-        if not rows:
-            continue
+def _column_groups(header_row: list[str]) -> list[list[int]]:
+    """Group column indices so each group is one logical column.
 
-        blocks.append(
-            TableBlock(
-                page_number=page_no or 1,
-                headers=headers,
-                rows=rows,
-                bbox=bbox,
-                caption=(table.caption_text(document) or None)
-                if hasattr(table, "caption_text")
-                else None,
-            )
+    ``vertical_strategy="text"`` splits on whitespace gaps, and a wide free-text column
+    splits with it: the description "EC2 t3.medium instance-hours" comes back as three
+    columns, ``['EC2 t3.medium', 'instance-hou', 'rs']``, under the single header
+    ``['Description', '', '']``.
+
+    An empty header is the signal — it means that column is a continuation of the last
+    named one, so it is folded back in and the cells are rejoined with a space. Without
+    this the extractor sees a description of "EC2 t3.medium" and two unnamed columns, and
+    ``_map_columns`` cannot recognise the table as line items at all.
+    """
+    groups: list[list[int]] = []
+    for index, header in enumerate(header_row):
+        if header or not groups:
+            groups.append([index])
+        else:
+            groups[-1].append(index)
+    return groups
+
+
+def _gutter_boundaries(page: Any, table: Any) -> list[float] | None:
+    """Column boundaries taken from the vertical gutters between words.
+
+    ``vertical_strategy="text"`` derives columns from *character* alignment, which lands
+    boundaries inside words: "EC2 t3.medium instance-hours" came back as three columns,
+    ``['EC2 t3.medium', 'instance-hou', 'rs']``, and the description that reached the
+    extractor was a fragment. Raising ``text_x_tolerance`` does not fix it — it merges
+    Unit Price into Amount before it merges the description back together.
+
+    This works one level up, on whole words. Every word's horizontal span inside the table
+    is merged into a set of occupied intervals; whatever is left is genuine whitespace
+    running the full height of the table, which is what a column gutter is. Boundaries go
+    down the middle of each gap wide enough to be a gutter rather than a word space.
+
+    Returns ``None`` when no interior gutter is found, so the caller can fall back rather
+    than force a single-column table.
+    """
+    x0, top, x1, bottom = table.bbox
+    try:
+        words = [
+            word
+            for word in page.extract_words()
+            if word["top"] >= top - 1
+            and word["bottom"] <= bottom + 1
+            and word["x0"] >= x0 - 1
+            and word["x1"] <= x1 + 1
+        ]
+    except Exception:  # noqa: BLE001 - fall back to the strategy's own columns
+        return None
+    if not words:
+        return None
+
+    spans = sorted((float(word["x0"]), float(word["x1"])) for word in words)
+    merged: list[list[float]] = [list(spans[0])]
+    for left, right in spans[1:]:
+        if left <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+
+    boundaries = [float(x0)]
+    for left_span, right_span in zip(merged, merged[1:]):
+        if right_span[0] - left_span[1] >= MIN_COLUMN_GUTTER:
+            boundaries.append((left_span[1] + right_span[0]) / 2)
+    boundaries.append(float(x1))
+    # Two entries means the page edges only — no interior column was found.
+    return boundaries if len(boundaries) > 2 else None
+
+
+def _extract_with_gutters(page: Any, table: Any, settings: dict[str, str]) -> list[list[Any]]:
+    """Re-extract a located table using word-gutter column boundaries.
+
+    The strategy pair is what *finds* the table and fixes its row bands; the columns it
+    infers along the way are the unreliable part. So the located region is re-read with
+    explicit vertical lines, and the original extraction is used only when no gutter can
+    be found.
+    """
+    boundaries = _gutter_boundaries(page, table)
+    if boundaries is None:
+        return list(table.extract())
+
+    explicit = dict(settings)
+    explicit["vertical_strategy"] = "explicit"
+    try:
+        rebuilt = page.find_tables(
+            table_settings={**explicit, "explicit_vertical_lines": boundaries}
         )
+    except Exception:  # noqa: BLE001
+        return list(table.extract())
 
-    return blocks
+    # find_tables can return several regions; keep the one covering this table.
+    for candidate in rebuilt:
+        if abs(candidate.bbox[1] - table.bbox[1]) < 2 and abs(candidate.bbox[3] - table.bbox[3]) < 2:
+            return list(candidate.extract())
+    return list(table.extract())
 
 
-def _page_text(document: Any, pages: dict[int, tuple[float, float]]) -> dict[int, list[str]]:
-    """Group extracted text items by the page they came from."""
-    by_page: dict[int, list[str]] = {page_no: [] for page_no in pages}
+def _extract_page_tables(
+    page: Any, page_number: int, inherited_headers: list[str] | None = None
+) -> list[TableBlock]:
+    """Find tables on one page, trying each strategy until one produces rows.
 
-    for item in getattr(document, "texts", []):
-        text = (getattr(item, "text", "") or "").strip()
-        if not text:
+    Strategies are tried in order rather than merged: running both and concatenating
+    yields the same table twice on a ruled invoice, and duplicate line items are worse
+    than a missed one — they would inflate the computed subtotal and trip the arithmetic
+    validator against a total that was correct all along.
+    """
+    for vertical, horizontal in TABLE_STRATEGIES:
+        settings = {"vertical_strategy": vertical, "horizontal_strategy": horizontal}
+        try:
+            found = page.find_tables(table_settings=settings)
+        except Exception as exc:  # noqa: BLE001 - a bad strategy must not kill the page
+            logger.debug(
+                "Table strategy %s/%s failed on page %d: %s",
+                vertical, horizontal, page_number, exc,
+            )
             continue
-        page_no, _ = _item_page_and_bbox(item, pages)
-        by_page.setdefault(page_no or 1, []).append(text)
 
-    return by_page
+        blocks: list[TableBlock] = []
+        for table in found:
+            try:
+                raw_rows = _extract_with_gutters(page, table, settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not extract a table on page %d: %s", page_number, exc)
+                continue
+            block = _table_from_rows(
+                raw_rows,
+                page_number,
+                _normalize_bbox(getattr(table, "bbox", None), page.width, page.height),
+                inherited_headers=inherited_headers,
+            )
+            if block is not None:
+                blocks.append(block)
+
+        if blocks:
+            logger.debug(
+                "page %d: %d table(s) via %s/%s strategy",
+                page_number, len(blocks), vertical, horizontal,
+            )
+            return blocks
+    return []
 
 
 def page_image_dir(document_id: str) -> Path:
@@ -396,25 +466,37 @@ def page_image_dir(document_id: str) -> Path:
     return UPLOAD_DIR / document_id / "pages"
 
 
-def _save_page_images(document: Any, document_id: str) -> dict[int, str]:
-    """Write each rendered page to disk for the previewer (design.md §5.1)."""
+def _save_page_images(path: Path, document_id: str) -> dict[int, str]:
+    """Render each page to disk for the previewer (design.md §5.1).
+
+    PyMuPDF rather than pdfplumber: it was already a dependency for triage, and
+    ``page.to_image()`` would pull in a separate raster stack. Pages are rendered and
+    written one at a time so peak memory is one page's pixmap, not the whole document —
+    which matters at 512 MB, where a 20-page render held in memory is not affordable.
+    """
+    try:
+        import fitz
+    except ImportError:  # pragma: no cover - declared dependency
+        return {}
+
     target_dir = page_image_dir(document_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     saved: dict[int, str] = {}
-    for page_no, page in document.pages.items():
-        image_ref = getattr(page, "image", None)
-        pil_image = getattr(image_ref, "pil_image", None) if image_ref else None
-        if pil_image is None:
-            continue
-
-        destination = target_dir / f"page_{int(page_no):03d}.png"
-        try:
-            pil_image.save(destination, format="PNG")
-        except OSError as exc:
-            logger.warning("Could not write page image %d: %s", page_no, exc)
-            continue
-        saved[int(page_no)] = str(destination)
+    try:
+        with fitz.open(path) as document:
+            for index, page in enumerate(document, start=1):
+                destination = target_dir / f"page_{index:03d}.png"
+                try:
+                    pixmap = page.get_pixmap(dpi=PAGE_RENDER_DPI)
+                    pixmap.save(destination)
+                    del pixmap
+                except Exception as exc:  # noqa: BLE001 - previewer is not load-bearing
+                    logger.warning("Could not render page %d: %s", index, exc)
+                    continue
+                saved[index] = str(destination)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not render pages for document_id=%s: %s", document_id, exc)
 
     return saved
 
@@ -429,52 +511,73 @@ def _text_yield_ratio(char_count: int) -> float:
 
 
 def _build_parsed_document(
-    result: ConversionResult,
+    path: Path,
     *,
     document_id: str,
-    source: Path,
-    used_ocr: bool,
     parse_seconds: float,
 ) -> ParsedDocument:
-    document = result.document
-    dimensions = _page_dimensions(document)
-    tables = _extract_tables(document, dimensions)
-    text_by_page = _page_text(document, dimensions)
-    images = _save_page_images(document, document_id)
+    """Read the PDF once, building pages and tables together.
+
+    One pass, page by page, with each page released before the next is opened. The
+    alternative — collecting every page's objects and post-processing — is how a parser
+    quietly becomes the largest allocation in a 512 MB process.
+    """
+    import pdfplumber
 
     pages: list[ParsedPage] = []
-    for page_no in sorted(dimensions) or [1]:
-        width, height = dimensions.get(page_no, (0.0, 0.0))
-        page_tables = [table for table in tables if table.page_number == page_no]
+    tables: list[TableBlock] = []
+    last_headers: list[str] | None = None
+    markdown_parts: list[str] = []
 
-        narrative = "\n".join(text_by_page.get(page_no, []))
-        table_rows = [row for table in page_tables for row in table.to_serialized_rows()]
-        markdown = "\n".join(filter(None, [narrative, *table_rows]))
+    images = _save_page_images(path, document_id)
 
-        pages.append(
-            ParsedPage(
-                page_number=page_no,
-                markdown=markdown,
-                narrative_markdown=narrative,
-                image_path=images.get(page_no),
-                width_points=width,
-                height_points=height,
-                char_count=len(markdown),
-                text_yield_ratio=_text_yield_ratio(len(markdown)),
-                table_count=len(page_tables),
-                used_ocr=used_ocr,
-            )
-        )
+    try:
+        with pdfplumber.open(path) as pdf:
+            for index, page in enumerate(pdf.pages, start=1):
+                page_tables = _extract_page_tables(page, index, last_headers)
+                if page_tables:
+                    # Carried to the next page so a table continued across a page break
+                    # keeps its columns. See _is_probable_header.
+                    last_headers = page_tables[-1].headers
+                tables.extend(page_tables)
+
+                narrative = page.extract_text() or ""
+                table_rows = [row for table in page_tables for row in table.to_serialized_rows()]
+                markdown = "\n".join(filter(None, [narrative, *table_rows]))
+                markdown_parts.append(markdown)
+
+                pages.append(
+                    ParsedPage(
+                        page_number=index,
+                        markdown=markdown,
+                        narrative_markdown=narrative,
+                        image_path=images.get(index),
+                        width_points=float(page.width or 0.0),
+                        height_points=float(page.height or 0.0),
+                        char_count=len(markdown),
+                        text_yield_ratio=_text_yield_ratio(len(markdown)),
+                        table_count=len(page_tables),
+                        used_ocr=False,
+                    )
+                )
+                # pdfplumber caches every char, line and rect it has seen on the page.
+                # Without this the cache grows for the life of the document and a
+                # 20-page statement holds all of it at once.
+                page.flush_cache()
+    except ParsingError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - translated into an actionable message
+        raise ParsingError(_explain_open_failure(path, str(exc))) from exc
 
     return ParsedDocument(
         document_id=document_id,
-        filename=source.name,
-        source_path=str(source),
+        filename=path.name,
+        source_path=str(path),
         page_count=max(1, len(pages)),
         pages=pages,
-        markdown=document.export_to_markdown(),
+        markdown="\n\n".join(markdown_parts),
         tables=tables,
-        used_ocr=used_ocr,
+        used_ocr=False,
         parse_seconds=parse_seconds,
     )
 
@@ -492,45 +595,35 @@ def parse_document(
     """Parse a financial document into a :class:`ParsedDocument`.
 
     Args:
-        source: Path to a PDF or image file.
+        source: Path to a PDF.
         document_id: Stable identifier. Generated if omitted.
-        force_ocr: ``True`` forces the OCR pass, ``False`` forbids it, ``None`` (default)
-            decides per page from ``text_yield_ratio``.
+        force_ocr: Accepted and ignored — there is no OCR stage left. Kept so existing
+            callers and stored requests do not break on an unexpected keyword.
         persist_source: Copy the original into ``data/uploads/<document_id>/`` (FR-1.5).
 
     Returns:
         A fully populated ``ParsedDocument``.
 
     Raises:
-        ParsingError: The file is missing, unsupported, oversized, corrupt, or
-            password-protected. The message is safe to show a user directly.
+        ParsingError: The file is missing, unsupported, an image, oversized, corrupt,
+            password-protected, or has no text layer. The message is safe to show a user
+            directly.
     """
-    settings = get_settings()
+    if force_ocr:
+        logger.warning("force_ocr=True ignored: OCR was removed with the Docling pipeline")
+
     path = Path(source).expanduser().resolve()
     _validate_source(path)
 
     document_id = document_id or str(uuid.uuid4())
-    is_image = path.suffix.lower() in IMAGE_EXTENSIONS
     started = time.perf_counter()
 
-    # Fast-path triage. An image has no text layer by definition; for a PDF, PyMuPDF
-    # answers the same question in milliseconds. Deciding here means a scanned PDF goes
-    # straight to the OCR pipeline instead of being parsed once to discover it needs OCR
-    # and then parsed again.
-    if force_ocr is None:
-        if is_image:
-            first_pass_ocr = settings.ocr_enabled
-        else:
-            text_layer, pages, chars = has_text_layer(path)
-            first_pass_ocr = (not text_layer) and settings.ocr_enabled
-            logger.info(
-                "Triage %s: %d page(s), %d chars, text_layer=%s -> ocr=%s",
-                path.name, pages, chars, text_layer, first_pass_ocr,
-            )
-    else:
-        first_pass_ocr = force_ocr
+    text_layer, page_count, chars = has_text_layer(path)
+    logger.info(
+        "Triage %s: %d page(s), %d chars, text_layer=%s", path.name, page_count, chars, text_layer
+    )
 
-    cache_key = (_content_hash(path), first_pass_ocr)
+    cache_key = _content_hash(path)
     cached = _PARSE_CACHE.get(cache_key)
     if cached is not None:
         _PARSE_CACHE.move_to_end(cache_key)
@@ -539,46 +632,26 @@ def parse_document(
             _persist_source(path, document_id)
         # Same content, possibly a new identifier. Page images on disk stay valid because
         # their paths are absolute and the rendered pages are identical.
-        return cached.model_copy(
-            update={"document_id": document_id, "parse_seconds": 0.0}
-        )
+        return cached.model_copy(update={"document_id": document_id, "parse_seconds": 0.0})
 
-    logger.info(
-        "Parsing document_id=%s ocr=%s image=%s", document_id, first_pass_ocr, is_image
-    )
-    result = _convert(path, with_ocr=first_pass_ocr)
+    logger.info("Parsing document_id=%s", document_id)
     parsed = _build_parsed_document(
-        result,
+        path,
         document_id=document_id,
-        source=path,
-        used_ocr=first_pass_ocr,
         parse_seconds=time.perf_counter() - started,
     )
 
-    # Second pass: some pages came back without a usable text layer, so re-run with OCR.
-    # Docling has no per-page OCR toggle, so this re-converts the document; that is why
-    # the first pass is skipped entirely for images.
-    should_retry = (
-        force_ocr is None
-        and settings.ocr_enabled
-        and not first_pass_ocr
-        and bool(parsed.pages_needing_ocr(settings.text_yield_threshold))
-    )
-    if should_retry:
-        low_pages = parsed.pages_needing_ocr(settings.text_yield_threshold)
-        logger.info(
-            "document_id=%s: %d/%d pages below text-yield threshold — re-parsing with OCR",
-            document_id,
-            len(low_pages),
-            parsed.page_count,
-        )
-        ocr_result = _convert(path, with_ocr=True)
-        parsed = _build_parsed_document(
-            ocr_result,
-            document_id=document_id,
-            source=path,
-            used_ocr=True,
-            parse_seconds=time.perf_counter() - started,
+    # Checked here rather than from the triage pass, because the two failures need
+    # different messages and triage cannot tell them apart: PyMuPDF reports a corrupt
+    # zero-page file as "1 page, 0 characters", which is indistinguishable from a scan.
+    # Letting pdfplumber attempt the read first means a damaged file raises its own
+    # "corrupt or not a valid PDF" error on the way through, and only a document that
+    # genuinely parsed but carries no text reaches this.
+    if all(page.char_count < MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER for page in parsed.pages):
+        raise ParsingError(
+            f"{path.name} has no extractable text layer — it looks like a scan or a photo. "
+            f"OCR was removed to fit the memory budget, so this cannot be read. Upload a "
+            f"PDF exported from the original document rather than a scan of it."
         )
 
     if persist_source:
@@ -590,12 +663,11 @@ def parse_document(
         _PARSE_CACHE.popitem(last=False)
 
     logger.info(
-        "document_id=%s parsed: %d pages, %d tables, %d rows, ocr=%s, %.1fs",
+        "document_id=%s parsed: %d pages, %d tables, %d rows, %.1fs",
         document_id,
         parsed.page_count,
         len(parsed.tables),
         parsed.total_rows,
-        parsed.used_ocr,
         parsed.parse_seconds,
     )
     return parsed

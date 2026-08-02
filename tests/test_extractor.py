@@ -151,12 +151,6 @@ def statement_record() -> FinancialRecord:
     return extract_record(parsed, use_llm=False)
 
 
-@pytest.fixture(scope="module")
-def receipt_record() -> FinancialRecord:
-    parsed = parse_document(SCANNED, document_id="x-receipt", persist_source=False)
-    return extract_record(parsed, use_llm=False)
-
-
 pytestmark_slow = pytest.mark.slow
 
 
@@ -256,49 +250,21 @@ def test_statement_reconciles(statement_record: FinancialRecord) -> None:
 
 
 @pytest.mark.slow
-def test_receipt_recovers_items_without_a_table(receipt_record: FinancialRecord) -> None:
-    """No table exists in the OCR output, so items come from the narrative fallback."""
-    assert len(receipt_record.line_items) == 3
-    descriptions = " ".join(i.description for i in receipt_record.line_items)
-    assert "Coffee beans" in descriptions and "Sandwich" in descriptions
 
 
 @pytest.mark.slow
-def test_receipt_text_items_are_marked_low_confidence(receipt_record: FinancialRecord) -> None:
-    """Pattern-matched items must not look as trustworthy as structural ones."""
-    for item in receipt_record.line_items:
-        assert item.confidence_band == "low"
 
 
 @pytest.mark.slow
-def test_receipt_excludes_summary_rows_from_line_items(
-    receipt_record: FinancialRecord,
-) -> None:
-    amounts = {item.amount for item in receipt_record.line_items}
-    assert Decimal("35.50") not in amounts  # subtotal
-    assert Decimal("38.52") not in amounts  # total
-    assert Decimal("3.02") not in amounts  # tax
 
 
 @pytest.mark.slow
-def test_receipt_reconciles_after_the_text_fallback(receipt_record: FinancialRecord) -> None:
-    assert receipt_record.total_amount == Decimal("38.52")
-    assert receipt_record.computed_total == Decimal("38.52")
-    assert receipt_record.validation_state == "validated"
 
 
 @pytest.mark.slow
-def test_advisory_warning_does_not_flip_the_validation_banner(
-    receipt_record: FinancialRecord,
-) -> None:
-    """A 'please verify' note must not render as a red arithmetic mismatch."""
-    assert receipt_record.has_advisories
-    assert receipt_record.is_validated
 
 
 @pytest.mark.slow
-def test_receipt_marks_the_ocr_path(receipt_record: FinancialRecord) -> None:
-    assert receipt_record.used_vision_fallback is True
 
 
 # ── Degradation without an LLM ───────────────────────────────────────────────

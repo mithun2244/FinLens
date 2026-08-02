@@ -70,8 +70,7 @@ EXPOSE 7860
 # second worker would hold its own copy and uploads would appear to vanish between
 # requests; the embedded Chroma store is single-process regardless (decision D-34).
 #
-# Note that boot is heavy: the lifespan hook loads Docling and MiniLM before serving, and
-# on a cold container that includes downloading ~500 MB of weights. The models are not
-# baked into the image because doing so means running Docling's downloader at build time,
-# which trades a slow first boot for a slow, network-dependent build.
+# Boot is cheap now. There are no model weights to load or download — the lifespan hook
+# imports the parsing libraries and pings the embedding endpoint, which is why this fits
+# where the previous image did not.
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]

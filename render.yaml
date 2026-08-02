@@ -7,12 +7,10 @@
 # Free tier, deliberately — rules.md Rule 1. Two consequences to plan around rather than
 # discover in production:
 #
-#   RAM.  512 MB, against a process that holds torch, a Docling layout model and MiniLM
-#         resident. api.py's lifespan hook loads all three at boot so the first request
-#         does not pay for it, which means the ceiling is hit during startup rather than
-#         under load. If the service dies while booting with no error of its own, this is
-#         the reason. The ways out are a larger instance, or deferring the model load and
-#         accepting a slow first request.
+#   RAM.  512 MB. This is what the pdfplumber/remote-embedding refactor was for: torch,
+#         the Docling layout model and MiniLM are all gone, and nothing is held resident
+#         at boot any more. See the measured figures in the refactor commit rather than
+#         trusting this comment.
 #   DATA. No disk, so data/ is ephemeral. Uploads, the Chroma store and the LLM cache are
 #         wiped on every deploy and every restart — and a free instance spins down after
 #         inactivity, so restarts are routine, not rare. Documents have to be re-uploaded
@@ -26,13 +24,11 @@ services:
     plan: free
     region: oregon
 
-    # torch is installed separately and first, from the CPU index. A plain
-    # `pip install torch` on Linux resolves to the CUDA build and drags in ~2.5 GB of
-    # libraries this CPU-only service will never call — requirements.txt carries the same
-    # instruction for local installs, and the build fails on size without it.
+    # Runtime dependencies only. requirements-dev.txt (streamlit, ragas, datasets,
+    # sentence-transformers, test tooling) is not installed here — it is the larger half
+    # of the old install and none of it is imported by the API.
     buildCommand: |
       pip install --upgrade pip
-      pip install torch --index-url https://download.pytorch.org/whl/cpu
       pip install -r requirements.txt
 
     # Single worker, deliberately. api.py keeps parsed documents in an in-process dict, so
@@ -57,6 +53,12 @@ services:
       # the API keeps its localhost default and the browser blocks every call from the
       # deployed UI. A wildcard is rejected at startup — see src/config.py.
       - key: ALLOWED_ORIGINS
+        sync: false
+
+      # Required. Embeddings are computed by the HuggingFace Inference API rather than
+      # in-process; without this retrieval cannot run and /api/health reports
+      # embeddings_configured: false. Free at hf.co/settings/tokens.
+      - key: HF_TOKEN
         sync: false
 
       # Optional tracing. The app runs normally without these (decision D-11).

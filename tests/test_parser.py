@@ -37,11 +37,6 @@ def multipage() -> ParsedDocument:
     return parse_document(MULTIPAGE, document_id="test-multipage", persist_source=False)
 
 
-@pytest.fixture(scope="module")
-def scanned() -> ParsedDocument:
-    return parse_document(SCANNED, document_id="test-scanned", persist_source=False)
-
-
 # ── Fixtures exist ───────────────────────────────────────────────────────────
 
 
@@ -146,39 +141,32 @@ def test_tables_on_page_filters_correctly(multipage: ParsedDocument) -> None:
     assert all(t.page_number == 2 for t in multipage.tables_on_page(2))
 
 
-# ── OCR fallback: fires when needed, and only then (D-15) ────────────────────
+# ── Scanned input is rejected, not OCR'd (revises D-15) ──────────────────────
 
 
-def test_ocr_does_not_fire_on_digital_pdfs(clean: ParsedDocument) -> None:
-    """OCR is a fallback. Running it on a text PDF would be slower and less accurate."""
+def test_digital_pdfs_are_not_marked_as_ocr(clean: ParsedDocument) -> None:
+    """``used_ocr`` survives as a schema field but is now always False."""
     assert clean.used_ocr is False
     assert not clean.pages_needing_ocr(get_settings().text_yield_threshold)
 
 
-def test_digital_page_has_healthy_text_yield(clean: ParsedDocument) -> None:
-    assert clean.pages[0].text_yield_ratio > get_settings().text_yield_threshold
+def test_an_image_upload_is_rejected_with_an_actionable_message() -> None:
+    """The OCR path is gone, so a photographed receipt cannot be read at all.
+
+    The message has to say so. "Supported formats: .pdf" does not tell someone who just
+    uploaded a photo of a receipt what to do instead, and this is a capability the
+    product previously had.
+    """
+    with pytest.raises(ParsingError) as excinfo:
+        parse_document(SCANNED, document_id="test-scanned", persist_source=False)
+    message = str(excinfo.value).lower()
+    assert "image" in message
+    assert "pdf" in message
 
 
-def test_ocr_fires_on_the_scanned_receipt(scanned: ParsedDocument) -> None:
-    assert scanned.used_ocr is True
-
-
-def test_ocr_recovers_the_receipt_total(scanned: ParsedDocument) -> None:
-    """The figures must survive OCR — this is the whole point of the fallback."""
-    text = scanned.markdown
-    assert "38.52" in text, f"Total missing from OCR output:\n{text}"
-    assert "35.50" in text, "Subtotal missing from OCR output"
-
-
-def test_ocr_recovers_the_vendor(scanned: ParsedDocument) -> None:
-    assert "CITY GROCERS" in scanned.markdown.upper()
-
-
-def test_force_ocr_false_prevents_the_fallback() -> None:
-    """An explicit opt-out is honoured even when the page clearly needs OCR."""
-    parsed = parse_document(
-        SCANNED, document_id="test-noocr", force_ocr=False, persist_source=False
-    )
+def test_force_ocr_is_accepted_and_ignored() -> None:
+    """Kept in the signature so existing callers do not break on an unexpected keyword."""
+    parsed = parse_document(CLEAN, document_id="test-forceocr", force_ocr=True, persist_source=False)
     assert parsed.used_ocr is False
 
 

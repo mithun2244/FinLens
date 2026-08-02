@@ -13,7 +13,6 @@ makes that class of breakage a one-line fix. Verify liveness with
 from __future__ import annotations
 
 import logging
-import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
@@ -41,7 +40,7 @@ EVAL_REPORTS_DIR: Final[Path] = EVALS_DIR / "reports"
 #: 2026-07-27 for exactly that reason — Groq meters each model separately, so it does buy
 #: a fresh bucket — and the sweep it unblocked was not comparable: citation rate 58.3%
 #: over 24 questions, and ``billing_date`` dropped from ``scanned_receipt.png``, which is
-#: a scored extraction field, not just an answer-quality wobble. The extractor
+#: a scored extraction field at the time, not just an answer-quality wobble. The extractor
 #: shares this constant, so a swap moves the deterministic numbers too. Wait for the
 #: refill instead, or accept that the run measures the substitute rather than the system.
 REASONING_MODEL: Final[str] = "llama-3.3-70b-versatile"
@@ -54,10 +53,10 @@ UTILITY_MODEL: Final[str] = "llama-3.1-8b-instant"
 #:
 #: The brief specified Llama 3.2 Vision; those endpoints were retired (D-3). We moved to
 #: Llama 4 Scout; ``check_models.py`` then proved Groq serves no image-input model at all
-#: — not Scout, not Maverick, nothing. Scanned pages are therefore handled by Docling's
-#: LOCAL OCR engine instead (see ``OCR_*`` below), which is faster, free, deterministic,
-#: rate-limit-free, and keeps document images on the machine. ``src/parser.py`` owns that
-#: fallback; no cloud model ever sees a page image.
+#: — not Scout, not Maverick, nothing. Scanned pages were therefore handled by a LOCAL
+#: OCR engine instead. That fallback has since been removed too: it was an onnxruntime
+#: model, and the 512 MB budget has no room for it. Scanned documents are now rejected at
+#: upload rather than silently parsed into an empty record — see ``src/parser.py``.
 #:
 #: Fallback candidates, tried in order if a primary ID stops being served.
 REASONING_MODEL_FALLBACKS: Final[tuple[str, ...]] = (
@@ -73,67 +72,69 @@ MODELS_BY_ROLE: Final[dict[ModelRole, str]] = {
     "utility": UTILITY_MODEL,
 }
 
-# ── Local OCR (decision D-15: replaces the cloud vision fallback entirely) ────
+# ── Table extraction (pdfplumber) ────────────────────────────────────────────
 
-#: Docling OCR engine. RapidOCR ships with docling-slim and runs on onnxruntime CPU —
-#: no system binary, no extra download beyond its own small ONNX models.
-OCR_ENGINE: Final[str] = "rapidocr"
-
-#: OCR languages, in RapidOCR's codes. Non-Latin scripts are out of scope (prd.md §7).
-OCR_LANGUAGES: Final[tuple[str, ...]] = ("english",)
-
-#: Minimum RapidOCR text confidence. Below this a detection is discarded rather than
-#: guessed at — a misread digit in a financial document is worse than a missing one.
-OCR_TEXT_SCORE: Final[float] = 0.5
-
-#: TableFormer mode. ACCURATE is ~2x slower than FAST but materially better on the
-#: ruled multi-column tables that invoices actually use — and table fidelity is the
-#: whole point of choosing Docling (architecture.md §3.2).
-TABLE_MODE_ACCURATE: Final[bool] = True
-
-#: Docling page-image scale factor (1.0 == 72 DPI). 2.0 gives ~144 DPI, close to
-#: PAGE_RENDER_DPI, which is enough for the previewer without ballooning memory.
+#: ``(vertical, horizontal)`` strategy pairs handed to pdfplumber, tried in order until
+#: one yields rows.
 #:
-#: Measured: turning page images off entirely saves nothing (3.63 s off vs 3.22 s on —
-#: inside run-to-run noise), so they stay on. They are what the document previewer and
-#: citation highlighting are built from.
-DOCLING_IMAGE_SCALE: Final[float] = 2.0
+#: The axes need different strategies, which is the whole reason this is a list of pairs
+#: rather than a list of strategies. Financial documents are typically ruled *across* —
+#: a line under the header, a line between rows — while the columns are held apart by
+#: whitespace alone. Measured on clean_invoice.pdf:
+#:
+#:     lines / lines   0 tables      (no vertical rules exist to close the cells)
+#:     text  / text    1 table, 31 rows of page furniture, headers like "Amazon"
+#:     text  / lines   1 table, 5 rows, headers Description/Qty/Unit Price/Amount
+#:
+#: So the middle entry is the one that matters, and ``text/text`` is kept only as a last
+#: resort for a table drawn with no rules at all — where it reliably swallows the whole
+#: page, hence last.
+#:
+#: Docling's TableFormer was replaced here (see the 512 MB refactor): it inferred cell
+#: structure from a layout model and needed none of this, but it is a torch model and
+#: torch alone exceeds the memory budget.
+TABLE_STRATEGIES: Final[tuple[tuple[str, str], ...]] = (
+    ("lines", "lines"),
+    ("text", "lines"),
+    ("text", "text"),
+)
 
-#: Threads for Docling's layout and TableFormer models.
-#:
-#: This is the single largest parsing lever, and it is easy to miss: Docling's
-#: ``AcceleratorOptions`` defaults to **4 threads** and sets torch's thread count itself,
-#: so calling ``torch.set_num_threads()`` from application code is overridden and does
-#: nothing. Measured on a 12-core machine, one page, TableFormer ACCURATE:
-#:
-#:     num_threads=4   3.58 s   (Docling's default)
-#:     num_threads=8   2.20 s
-#:     num_threads=12  2.06 s   (-42%)
-#:
-#: Capped at 8 by default: the gain from 8 to 12 is small, and leaving headroom keeps the
-#: UI responsive while a document parses.
-DOCLING_NUM_THREADS: Final[int] = max(1, min(8, (os.cpu_count() or 4)))
+#: Minimum horizontal whitespace, in points, that counts as a column gutter rather than
+#: the space between two words. Used to derive explicit column boundaries from word
+#: positions — see ``_gutter_boundaries``, and the mid-word splits it exists to prevent.
+MIN_COLUMN_GUTTER: Final[float] = 4.0
 
 #: Minimum extracted characters per page for a PDF to count as having a text layer.
 #:
-#: Used by the PyMuPDF triage pass to decide OCR *before* invoking Docling, which avoids
-#: parsing a scanned document twice. Deliberately low. Measured on the fixture set:
+#: This used to select between the text pipeline and OCR. With OCR gone it decides
+#: something starker: whether the document can be read at all. Below this the upload is
+#: rejected with an explanation, because the alternative — returning a document with no
+#: line items and no total — looks like a successful parse of an empty invoice.
 #:
-#:     scanned_receipt.png        0 chars/page
+#: Deliberately low. Measured on the fixture set:
+#:
 #:     multipage_statement.pdf  289 chars/page
 #:     clean_invoice.pdf        511 chars/page
 #:
 #: The question is "is there a text layer at all", not "is this page dense". A threshold
-#: near 100 words/page (~500 chars) would wrongly send the sparse two-page statement
-#: through OCR; 50 separates the real cases with a wide margin.
+#: near 100 words/page (~500 chars) would wrongly reject the sparse two-page statement;
+#: 50 separates the real cases with a wide margin.
 MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER: Final[int] = 50
 
 #: How many parsed documents to keep in the in-process cache, keyed by content hash.
 #: Re-uploading a file already parsed in this session returns instantly.
 PARSE_CACHE_SIZE: Final[int] = 16
 
-# ── Local embedding model (decision D-2: embeddings never leave the machine) ──
+# ── Embedding model (served remotely — see the note on D-2 below) ────────────
 
+#: The same model as before, now called over HTTP instead of loaded in-process.
+#:
+#: **This reverses decision D-2.** Embeddings used to be computed locally, and the
+#: guarantee was that financial text never left the machine at embed time. Fitting inside
+#: 512 MB means sentence-transformers and torch have to go, and every remaining option
+#: sends the text somewhere. Keeping the *same* model matters for two reasons: retrieval
+#: quality is unchanged, and the vectors stay 384-dimensional, so existing Chroma
+#: collections remain readable rather than needing a rebuild.
 EMBEDDING_MODEL: Final[str] = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIMENSIONS: Final[int] = 384
 
@@ -149,8 +150,12 @@ COLLECTION_POLICIES: Final[str] = "policy_corpus"
 # ── Ingestion constraints ─────────────────────────────────────────────────────
 
 MAX_UPLOAD_BYTES: Final[int] = 25 * 1024 * 1024  # FR-1.1
+#: Still enumerated, though no longer supported: an upload with one of these suffixes gets
+#: "images are not supported since OCR was removed" rather than the generic "supported
+#: formats: .pdf", which does not tell a user who just uploaded a photo of a receipt what
+#: went wrong or what to do instead.
 IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset({".png", ".jpg", ".jpeg", ".webp"})
-SUPPORTED_EXTENSIONS: Final[frozenset[str]] = frozenset({".pdf"}) | IMAGE_EXTENSIONS
+SUPPORTED_EXTENSIONS: Final[frozenset[str]] = frozenset({".pdf"})
 
 #: Denominator for ``ParsedPage.text_yield_ratio``.
 #:
@@ -210,15 +215,21 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # Behavior.
+    # Required — Hugging Face Inference API, free tier. Embeddings are computed there
+    # rather than in-process; without it retrieval cannot run at all.
+    hf_token: str = Field(default="", description="Hugging Face token for the embedding API")
+
+    #: Where the embedding request goes. Overridable so a self-hosted Text Embeddings
+    #: Inference server, or any OpenAI-compatible embedding endpoint, can be dropped in
+    #: without a code change — which is also how this gets back to embeddings that never
+    #: leave the machine, if that matters more than the memory budget later.
+    embedding_endpoint_url: str = ""
+
     text_yield_threshold: float = Field(
         default=0.15,
         ge=0.0,
         le=1.0,
-        description="Below this Docling text-yield ratio a page escalates to local OCR (FR-2.3, D-15)",
-    )
-    ocr_enabled: bool = Field(
-        default=True,
-        description="Allow the local OCR fallback for scanned pages. Disable to parse text layers only.",
+        description="Below this text-yield ratio a page is treated as having no text layer",
     )
     retrieval_k_document: int = Field(default=6, ge=1, le=50)
     retrieval_k_policy: int = Field(default=4, ge=0, le=50)
@@ -251,6 +262,15 @@ class Settings(BaseSettings):
                 "user's behalf. List the frontend origins explicitly, comma-separated."
             )
         return value.strip()
+
+    @property
+    def embeddings_configured(self) -> bool:
+        """True when the embedding API can be called.
+
+        A custom endpoint may be unauthenticated (a local TEI server, say), so either a
+        token or an explicit URL is enough.
+        """
+        return bool(self.hf_token.strip() or self.embedding_endpoint_url.strip())
 
     @property
     def groq_configured(self) -> bool:
