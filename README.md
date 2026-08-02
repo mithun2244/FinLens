@@ -1,3 +1,13 @@
+---
+title: FinLens
+emoji: 🔍
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # FinLens — Multimodal AI Financial Assistant
 
 Upload a financial document — an invoice, a card statement, a photographed receipt — and ask
