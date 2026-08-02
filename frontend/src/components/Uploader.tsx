@@ -10,7 +10,7 @@ import { SectionLabel } from "@/components/Shell";
 
 type Status =
   | { phase: "idle" }
-  | { phase: "working"; step: number; filename: string }
+  | { phase: "working"; filename: string }
   | { phase: "done"; filename: string; seconds: number }
   | { phase: "error"; message: string };
 
@@ -23,25 +23,26 @@ interface UploaderProps {
   onBusyChange?: (busy: boolean) => void;
 }
 
-const ACCEPTED = [".pdf", ".png", ".jpg", ".jpeg", ".webp"];
-
-/** The triage pipeline, worded to match what the backend actually does.
+/** PDF only.
  *
- *  The design's second step read "Bypassing OCR — native text found", which is exactly
- *  our PyMuPDF triage pass (D-35): it decides in milliseconds whether a PDF has a text
- *  layer, so a digital document never goes through OCR. */
+ *  Images used to be accepted and OCR'd; that path went with Docling, and the backend
+ *  now rejects them at upload. Listing them here produced a file picker that let you
+ *  choose a .png and then failed server-side — the UI promising what the API refuses.
+ */
+const ACCEPTED = [".pdf"];
+
+/** The triage pipeline, worded to match what the backend actually does. */
 const STEPS = [
   "Checking text layer",
-  "Bypassing OCR — native text found",
-  "Extracting layout & tables",
+  "Reading tables & layout",
+  "Extracting line items",
   "Linking numeric entities",
 ];
 
-/** File-type badges from the design, mapped to what each type means for the pipeline. */
+/** File-type badges, mapped to what each type means for the pipeline. */
 const KINDS = [
   { label: "PDF", note: "native text", color: "text-state-bad" },
   { label: "MULTI", note: "tabular", color: "text-state-info" },
-  { label: "IMG", note: "needs OCR", color: "text-state-warn" },
 ];
 
 function TriageRing({ pct }: { pct: number }) {
@@ -95,22 +96,21 @@ export function Uploader({
       const started = performance.now();
       clearTimers();
       setPct(0);
-      setStatus({ phase: "working", step: 0, filename });
+      setStatus({ phase: "working", filename });
       onBusyChange?.(true);
 
       // The ring advances on a timer while the real work happens. It is a progress
       // *indication*, not a measurement — the backend does not stream parse progress,
       // and it is capped below 100 so it never claims completion the work has not
       // reached.
+      //
+      // The step is derived from `pct` at render rather than tracked alongside it. It
+      // used to be its own state, advanced from inside this interval using `pct` from
+      // the enclosing closure — which is fixed at the value `run` was called with, so
+      // `Math.floor((0 + 2) / 25)` evaluated to 0 on every tick and the checklist sat
+      // frozen on the first step for the whole upload while the ring filled beside it.
       timers.current.push(
-        setInterval(() => {
-          setPct((p) => Math.min(94, p + 2));
-          setStatus((s) =>
-            s.phase === "working"
-              ? { ...s, step: Math.min(STEPS.length - 1, Math.floor((pct + 2) / 25)) }
-              : s
-          );
-        }, 90)
+        setInterval(() => setPct((p) => Math.min(94, p + 2)), 90)
       );
 
       try {
@@ -136,7 +136,7 @@ export function Uploader({
         onBusyChange?.(false);
       }
     },
-    [clearTimers, onBusyChange, onLoaded, pct]
+    [clearTimers, onBusyChange, onLoaded]
   );
 
   const handleFiles = useCallback(
@@ -158,6 +158,7 @@ export function Uploader({
 
   const busy = status.phase === "working" || disabled;
   const running = status.phase === "working";
+  const step = Math.min(STEPS.length - 1, Math.floor(pct / (100 / STEPS.length)));
 
   return (
     <section
@@ -187,6 +188,21 @@ export function Uploader({
           if (!busy) handleFiles(e.dataTransfer.files);
         }}
         onClick={() => !busy && inputRef.current?.click()}
+        // Focusable and operable from the keyboard. It looks like a button and is the
+        // primary action in the panel, but a bare div with onClick is reachable only by
+        // mouse — the file input it drives is visually hidden, so there was no keyboard
+        // path to uploading a document at all.
+        role="button"
+        tabIndex={busy ? -1 : 0}
+        aria-label="Choose a PDF to ingest"
+        aria-disabled={busy}
+        onKeyDown={(e) => {
+          if (busy) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            inputRef.current?.click();
+          }
+        }}
         style={{
           borderColor: dragging ? "hsl(119 99% 46%)" : "hsl(0 0% 22%)",
           background: dragging ? "hsl(119 99% 46% / 0.07)" : "hsl(0 0% 11%)",
@@ -220,7 +236,7 @@ export function Uploader({
             {dragging ? "Release to ingest" : "Drop financial documents"}
           </div>
           <div className="font-mono text-[9.5px] tracking-[0.1em] text-ink-muted">
-            PDF · STATEMENT · SCANNED RECEIPT · PNG
+            PDF · INVOICE · STATEMENT
           </div>
         </div>
         <span className="rounded bg-accent px-[15px] py-[7px] text-[11px] font-semibold uppercase tracking-[0.1em] text-accent-ink transition-[filter] hover:brightness-110">
@@ -254,7 +270,7 @@ export function Uploader({
               )}
             >
               {running
-                ? STEPS[status.step]
+                ? STEPS[step]
                 : status.phase === "done"
                   ? `Triage complete · ${status.seconds.toFixed(1)}s`
                   : "Awaiting a document"}
@@ -264,8 +280,8 @@ export function Uploader({
 
         <div className="flex flex-col gap-[9px]">
           {STEPS.map((label, i) => {
-            const done = status.phase === "done" || (running && i < status.step);
-            const active = running && i === status.step;
+            const done = status.phase === "done" || (running && i < step);
+            const active = running && i === step;
             return (
               <div key={label} className="flex items-center gap-[9px]">
                 <div
@@ -321,13 +337,8 @@ export function Uploader({
       <div className="flex flex-col gap-2">
         {samples.map((sample, index) => {
           const active = status.phase === "done" && status.filename === sample.filename;
-          const isImage = /\.(png|jpe?g|webp)$/i.test(sample.filename);
-          const kind = isImage ? "IMG" : sample.filename.includes("statement") ? "MULTI" : "PDF";
-          const kindColor = isImage
-            ? "hsl(38 92% 60%)"
-            : kind === "MULTI"
-              ? "hsl(199 80% 62%)"
-              : "hsl(0 84% 66%)";
+          const kind = sample.filename.includes("statement") ? "MULTI" : "PDF";
+          const kindColor = kind === "MULTI" ? "hsl(199 80% 62%)" : "hsl(0 84% 66%)";
           return (
             <motion.button
               key={sample.filename}

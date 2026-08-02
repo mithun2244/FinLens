@@ -76,8 +76,9 @@ export function AppHeader({
 
       <div className="flex items-center gap-3">
         {/* The design's badge read "VISION MODEL ONLINE". This system has no vision
-            model — Groq serves none, and scanned pages go through local OCR instead
-            (decision D-15). The badge shows the model actually in use. */}
+            model — Groq serves none — and the local OCR fallback that once covered
+            scanned pages was removed to fit the memory budget. The badge shows the
+            model actually in use, and nothing else. */}
         <div className="flex items-center gap-[7px] rounded-full border border-edge-default bg-surface-raised px-[11px] py-[5px]">
           <div
             className={
@@ -91,7 +92,7 @@ export function AppHeader({
             {offline
               ? "API OFFLINE"
               : health?.llm_configured
-                ? `${health.reasoning_model.toUpperCase()} · LOCAL OCR`
+                ? health.reasoning_model.toUpperCase()
                 : "NO API KEY"}
           </span>
         </div>
@@ -163,9 +164,9 @@ export function Hero() {
           className="m-0 mb-[30px] max-w-[660px] text-pretty text-[clamp(0.875rem,1.5vw,1.25rem)] font-light leading-[1.6] text-ink-secondary"
           style={rise(0.55)}
         >
-          Invoices, statements and scanned receipts parsed in seconds. Layout-aware
-          extraction with page-anchored citations, so every number traces back to the
-          region it came from.
+          Invoices and statements parsed in seconds. Table-aware extraction with
+          page-anchored citations, so every number traces back to the region it came
+          from.
         </p>
 
         <div className="flex flex-wrap gap-3" style={rise(0.7)}>
