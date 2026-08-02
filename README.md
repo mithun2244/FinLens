@@ -274,16 +274,35 @@ Being straight about this matters more than a green badge.
   row chunks inherit the table's bounding box.
 - **Comma-decimal amounts are rejected, not parsed.** `1.234,56` returns `None` rather than risk a
   1000× error. Latin-script, period-decimal documents only.
+- **PDFs with a text layer only.** Scanned documents, photographed receipts and image uploads
+  are rejected rather than parsed — OCR was removed to fit the 512 MB deployment. A PDF whose
+  pages carry no extractable text is refused too, because parsing one yields a record with no
+  line items and no total, which is indistinguishable from an empty invoice.
+- **Tables are read from the PDF's own structure**, so a table drawn with neither ruling lines
+  nor consistent column gutters may extract incompletely.
 - **No handwriting recognition**, no multi-user auth, no bank integrations. See `prd.md` §7.
 - Streamlit columns stack below 1200px rather than becoming the tabbed layout `design.md` §4.2
   sketches.
 
 ## Privacy
 
-Documents are parsed, embedded, and stored entirely on your machine. `data/` is gitignored in
-full. Only the text of retrieved chunks and your question are sent to Groq, and only when you ask
-one — page images never leave the machine. No real financial documents are in this repository, and
-`rules.md` Rule 4 forbids adding any.
+Documents are parsed and stored entirely on your machine, and `data/` is gitignored in full.
+Page images never leave it.
+
+**Text does.** Two things go out, and it is worth being precise about which:
+
+- **Embeddings.** Every chunk of an indexed document is sent to the Hugging Face Inference
+  API to be turned into a vector — at upload time, not only when you ask something. This
+  reverses an earlier design decision (D-2) and was the price of fitting the service into
+  512 MB, since computing embeddings locally means shipping torch. Set
+  `EMBEDDING_ENDPOINT_URL` to a self-hosted [Text Embeddings Inference][tei] server to
+  restore locality; the code path is identical.
+- **Answering.** The text of retrieved chunks and your question go to Groq, and only when
+  you ask one.
+
+No real financial documents are in this repository, and `rules.md` Rule 4 forbids adding any.
+
+[tei]: https://github.com/huggingface/text-embeddings-inference
 
 ---
 
