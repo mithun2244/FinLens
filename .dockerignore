@@ -1,0 +1,66 @@
+# The build context is NOT filtered by .gitignore — Docker reads this file and nothing
+# else. Anything omitted here is uploaded to the daemon and can be baked into the image,
+# including files git has been told to ignore.
+
+# Secrets. .env is gitignored, which is exactly why it needs listing here too: it exists
+# on a developer's machine, and without this line it would be copied into the image.
+# Rule 4 — inject GROQ_API_KEY at runtime instead.
+.env
+.env.*
+
+# Local virtualenv. Linux wheels are installed in the image; copying a Windows venv in
+# would be both enormous and useless.
+venv/
+.venv/
+
+# Runtime state, recreated on boot by ensure_directories(). Copying a local Chroma store
+# in would ship one machine's indexed documents to every deployment.
+data/
+
+# Test and lint caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# The frontend is a separate service and is not built or served by this image.
+frontend/
+
+# Not needed at runtime. evals/fixtures/ IS needed — /api/samples and /api/policies serve
+# the sample documents and policy corpus from it — so this is deliberately narrow.
+evals/reports/
+evals/golden_set.jsonl
+evals/extraction_expectations.jsonl
+tests/
+scripts/
+docs/
+.github/
+.streamlit/
+.claude/
+.gstack/
+
+# Streamlit is the other frontend (decision D-8) and does not run in this image.
+app.py
+ui/
+
+# Documentation and project notes.
+#
+# Root level only, and it has to stay that way: Docker's `*` does not cross a directory
+# separator, so this matches ./architecture.md but not evals/fixtures/policies/*.md —
+# which is the policy corpus /api/policies ingests. "Fixing" this to `**/*.md` would build
+# an image whose policy questions all come back unanswerable.
+*.md
+!README.md
+
+# Version control and editor state.
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+
+# Other deployment targets.
+render.yaml
