@@ -24,12 +24,19 @@ that need no credit card. Embeddings and reasoning are cloud calls; see
 
 ## Live Demo
 
-**API docs (interactive):** <https://ai-finlens.onrender.com/docs>
+**The app:** <https://fin-lens-eta.vercel.app>
 
-FastAPI's Swagger UI — every endpoint below can be called from the browser, no client needed.
+The Next.js workspace — upload a document, watch it parse, ask questions with citations you
+can click back to the page region they came from.
 
-> Hosted on Render's free tier, which **spins the service down when idle**. The first request
-> after a quiet period wakes it and can take 30-60 seconds; everything after that is fast.
+**Backend API Documentation (Swagger UI):** <https://ai-finlens.onrender.com/docs>
+
+Every endpoint below, callable from the browser with no client needed. The frontend is
+hosted on Vercel and the API on Render, as two separate services.
+
+> The API runs on Render's free tier, which **spins the service down when idle**. The first
+> request after a quiet period wakes it and can take 30-60 seconds; everything after that is
+> fast. That applies to the app too, since it calls the same API.
 
 ### Endpoints
 
