@@ -2,7 +2,8 @@
 #
 # Three jobs so a red X says which part broke:
 #   quality  — ruff + mypy over the Python source. Seconds, no model downloads.
-#   test     — the offline pytest suite against real Docling/Chroma/MiniLM.
+#   test     — the offline pytest suite against real pdfplumber/Chroma, with the
+#              embedding endpoint stubbed by tests/conftest.py.
 #   frontend — eslint + next build for the Next.js app in frontend/.
 #
 # The jobs are independent and run in parallel; a TypeScript error must not be reported
@@ -83,54 +84,11 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # CPU-only torch AND torchvision, installed BEFORE requirements.txt so the resolver
-      # sees both already satisfied and never reaches for the default PyPI wheels, which
-      # bundle ~2.5 GB of CUDA libraries a CPU runner cannot use.
-      #
-      # torchvision is not optional. `docling-ibm-models` requires it for the RT-DETR
-      # layout model, so requirements.txt pulls it in transitively. Installing only torch
-      # here left pip to fetch torchvision from default PyPI — a build compiled against a
-      # different torch — and the ABI mismatch surfaced at test time as:
-      #
-      #     RuntimeError: operator torchvision::nms does not exist
-      #     ModuleNotFoundError: Could not import module 'RTDetrImageProcessor'
-      #
-      # Both must come from the same index to stay ABI-compatible. Verified locally:
-      # torch 2.13.0+cpu with torchvision 0.28.0+cpu registers torchvision::nms correctly.
-      #
-      # torchaudio is genuinely unused — nothing in the dependency tree requires it.
-      - name: Install CPU-only PyTorch and torchvision
-        run: |
-          python -m pip install --upgrade pip
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-      # Guard the pairing before spending time on the rest of the install. A silent ABI
-      # mismatch here costs a full test run to discover otherwise.
-      - name: Verify the torch/torchvision pairing
-        run: |
-          python - <<'PY'
-          import torch, torchvision
-          from torchvision.ops import nms  # noqa: F401
-          print(f"torch       {torch.__version__}")
-          print(f"torchvision {torchvision.__version__}")
-          assert torch.__version__.endswith("+cpu"), "torch is not the CPU build"
-          assert torchvision.__version__.endswith("+cpu"), "torchvision is not the CPU build"
-          assert hasattr(torch.ops.torchvision, "nms"), "torchvision::nms not registered"
-          print("torchvision::nms registered — ABI pairing is good")
-          PY
-
+      # requirements-dev.txt is required, not optional: pytest lives there. The runtime
+      # requirements.txt was trimmed to what the API imports so the 512 MB deployment does
+      # not carry the test and eval stack, which means CI has to ask for it explicitly.
       - name: Install project dependencies
-        run: pip install -r requirements.txt
-
-      # Docling's layout/TableFormer models and the MiniLM embedding model are ~600 MB
-      # fetched from the HuggingFace Hub on first use. Caching keeps subsequent runs off
-      # the network, which is both faster and less flaky than re-downloading every push.
-      - name: Cache HuggingFace models
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: hf-models-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: hf-models-${{ runner.os }}-
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
       # Fixtures are committed, but regenerating proves make_fixtures.py still runs and
       # that its built-in arithmetic assertions hold. Synthetic data only — no real
