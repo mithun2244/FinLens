@@ -35,7 +35,11 @@ from typing import Any, Literal  # noqa: E402
 
 from fastapi import FastAPI, File, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
+from fastapi.responses import (  # noqa: E402
+    FileResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field  # noqa: E402
 
 from src import AssistantError, ParsingError  # noqa: E402
@@ -271,6 +275,17 @@ def _policies_indexed() -> bool:
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """Send the bare domain to the API docs.
+
+    Every route is under ``/api``, so the root served a bare 404 — which reads as "the
+    deployment is broken" to anyone opening the link, rather than "this is an API".
+    ``include_in_schema=False`` keeps a redirect out of the endpoint list it redirects to.
+    """
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/api/health", response_model=HealthOut)
