@@ -18,7 +18,7 @@ charge, and answers with every figure traceable to a source.
 that need no credit card. Embeddings and reasoning are cloud calls; see
 [The zero-cost stack](#the-zero-cost-stack) for where each piece runs.
 
-![The dashboard](docs/dashboard.png)
+![The ingest panel: drop zone, triage pipeline with all four steps complete, and the sample document queue](docs/ui-preview.png)
 
 ---
 
