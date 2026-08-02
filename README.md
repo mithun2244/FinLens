@@ -10,14 +10,54 @@ pinned: false
 
 # FinLens — Multimodal AI Financial Assistant
 
-Upload a financial document — an invoice, a card statement, a photographed receipt — and ask
-*"why was this charge deducted?"*. FinLens extracts the structured record, retrieves the policy
-that explains the charge, and answers with every figure traceable to a source.
+Upload a financial document — an invoice or a card statement — and ask *"why was this charge
+deducted?"*. FinLens extracts the structured record, retrieves the policy that explains the
+charge, and answers with every figure traceable to a source.
 
-**It runs at $0.** Documents are parsed locally, embedded locally, and stored locally. The only
-cloud calls are one or two per question, against a free tier that needs no credit card.
+**It runs at $0.** Documents are parsed locally and vectors are stored locally, on free tiers
+that need no credit card. Embeddings and reasoning are cloud calls; see
+[The zero-cost stack](#the-zero-cost-stack) for where each piece runs.
 
 ![The dashboard](docs/dashboard.png)
+
+---
+
+## Live Demo
+
+**API docs (interactive):** <https://ai-finlens.onrender.com/docs>
+
+FastAPI's Swagger UI — every endpoint below can be called from the browser, no client needed.
+
+> Hosted on Render's free tier, which **spins the service down when idle**. The first request
+> after a quiet period wakes it and can take 30-60 seconds; everything after that is fast.
+
+### Endpoints
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/api/health` | Liveness, plus whether the LLM and embedding endpoints are configured. Never fails on a missing key — it reports. |
+| `POST` | `/api/upload` | Parse, extract and index a PDF (`multipart/form-data`, field `file`). Returns the full structured record. |
+| `POST` | `/api/chat` | Ask a question. Streams newline-delimited JSON events: `stage`, `token`, `answer`, `error`. Takes `question` and an optional `document_id` to scope retrieval to one document. |
+| `GET` | `/api/samples` | The bundled sample documents, so the API can be tried without uploading anything. |
+| `POST` | `/api/samples/{filename}` | Load one of those samples as if it had been uploaded. |
+| `POST` | `/api/policies` | Index the policy corpus that cross-document questions are answered against. |
+| `GET` | `/api/documents/{id}/pages/{n}` | Rendered page image, used by the previewer for citation highlighting. |
+| `DELETE` | `/api/documents/{id}` | Remove a document and its chunks from the index. |
+
+### Try it in one command
+
+```bash
+# Upload a sample and read back the extracted record
+curl -X POST https://ai-finlens.onrender.com/api/samples/clean_invoice.pdf
+
+# Ask a question about it (use the document_id returned above)
+curl -X POST https://ai-finlens.onrender.com/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"Why is the NAT Gateway charge so high?","document_id":"<id>"}'
+```
+
+Check `GET /api/health` first. `llm_configured` and `embeddings_configured` tell you whether
+answering and retrieval are actually available — extraction works even when both are false.
 
 ---
 
@@ -51,10 +91,9 @@ Ask it something the documents do not answer and it refuses:
 | Layer | Technology | Cost | Runs |
 |---|---|---|---|
 | Orchestration | Python 3.12 + LangChain (LCEL) | Free (OSS) | Local |
-| Document parsing | Docling — layout + TableFormer | Free (OSS) | Local, CPU |
-| OCR fallback | RapidOCR via onnxruntime | Free (OSS) | Local, CPU |
+| Document parsing | pdfplumber (text + tables) + PyMuPDF (rendering) | Free (OSS) | Local, CPU |
 | Vector store | ChromaDB, embedded persistent client | Free (OSS) | Local, on disk |
-| Embeddings | `all-MiniLM-L6-v2`, 384-dim | Free (OSS) | Local, CPU |
+| Embeddings | `all-MiniLM-L6-v2`, 384-dim, via HF Inference API | Free tier | Cloud |
 | Reasoning | Groq — `llama-3.3-70b-versatile` | Free tier | Cloud |
 | Query rewriting / eval judge | Groq — `llama-3.1-8b-instant` | Free tier | Cloud |
 | Evaluation | Ragas | Free (OSS) | Local + Groq |
@@ -67,18 +106,25 @@ why it is a design forcing function rather than a budget.
 
 ## Setup
 
-**Requirements:** Python 3.10+ (developed on 3.12.10), ~4 GB disk for models, CPU only.
+**Requirements:** Python 3.10+ (developed on 3.12.10), CPU only. No model weights are
+downloaded — the runtime install is small enough to fit a 512 MB container.
 
 ```bash
 python -m venv venv
 venv\Scripts\activate            # Windows;  source venv/bin/activate elsewhere
 
-# CPU-only torch first — saves ~2 GB of CUDA wheels you will not use.
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
+pip install -r requirements.txt                          # the API
+pip install -r requirements.txt -r requirements-dev.txt  # + Streamlit, evals, tests
 ```
 
-**Get a free Groq key** at [console.groq.com/keys](https://console.groq.com/keys) — no credit card.
+`requirements.txt` is runtime-only, so the deployed image stays inside 512 MB. Streamlit,
+Ragas and the test tooling live in `requirements-dev.txt` — you need both to run the suite
+or the dashboard.
+
+**Get two free keys**, neither needing a credit card: a Groq key at
+[console.groq.com/keys](https://console.groq.com/keys) for reasoning, and a Hugging Face token
+at [hf.co/settings/tokens](https://hf.co/settings/tokens) for embeddings. Extraction works
+without either; answering needs Groq and retrieval needs the HF token.
 
 ```bash
 cp .env.example .env
@@ -111,9 +157,9 @@ python scripts/make_fixtures.py
 streamlit run app.py
 ```
 
-First launch downloads ~500 MB of Docling layout models and takes about 20 seconds. After that it
-is cached and fully offline. The app then opens on the Document Workspace — drop a PDF or image,
-or click one of the four sample documents.
+Launch is fast — there are no model weights to download or load. The app opens on the Document
+Workspace; drop a PDF or click one of the sample documents. PDFs only: scanned images are
+rejected, because OCR was removed to fit the deployment budget.
 
 **Evaluation:**
 
@@ -126,8 +172,8 @@ python -m src.evals --limit 8       # quick spot check
 **Tests:**
 
 ```bash
-pytest                    # 198 offline tests, no API calls, free
-pytest -m integration     # 8 live-API tests
+pytest                    # 254 offline tests, no API calls, free
+pytest -m integration     # 10 live-API tests (needs GROQ_API_KEY and HF_TOKEN)
 mypy src app.py ui        # clean across 14 modules
 ```
 
@@ -136,15 +182,16 @@ mypy src app.py ui        # clean across 14 modules
 ## How it works
 
 ```
-upload ─→ parser.py ─→ extractor.py ─→ vectorstore.py ─→ chain.py ─→ app.py
-          Docling      FinancialRecord   Chroma+MiniLM    Groq RAG    Streamlit
+upload ─→ parser.py ──→ extractor.py ─→ vectorstore.py ──→ chain.py ─→ app.py
+          pdfplumber    FinancialRecord   Chroma +          Groq RAG    Streamlit
+          + PyMuPDF                       MiniLM over HTTP              / api.py
              │
-             └─→ RapidOCR (only when a page has no text layer)
+             └─→ a PDF with no text layer is rejected, not OCR'd
 ```
 
 Three design decisions shape everything else:
 
-**Numbers are deterministic, prose is not.** Line items come from Docling's table structure and
+**Numbers are deterministic, prose is not.** Line items come from the PDF's own table structure and
 totals from labelled-amount regexes. The model supplies vendor names and dates — things that vary
 too much for patterns. Where the model *does* propose an amount, it is accepted only if that exact
 figure appears in the document text. The model can read; it cannot invent.
@@ -156,7 +203,7 @@ attached to the wrong amount, which is the dominant cause of hallucinated invoic
 chain verifies: citation markers are resolved against chunks actually retrieved (invented ones are
 reported), and every monetary figure is traced to the record or to a retrieved snippet.
 
-Bounding boxes from Docling are normalized to top-left 0–1 coordinates, so clicking a citation
+Bounding boxes from pdfplumber are normalized to top-left 0–1 coordinates, so clicking a citation
 highlights the source region on the page image:
 
 ![Citation highlighting](docs/citation-highlight.png)
@@ -173,7 +220,7 @@ ui/components.py          render helpers for the four surfaces
 src/config.py             model IDs, paths, thresholds — model strings live ONLY here
 src/llm.py                ChatGroq factory, provider-error translation, retries
 src/schemas.py            FinancialRecord, Citation, Answer, RunStats — all money is Decimal
-src/parser.py             Docling ingestion, OCR fallback, bbox normalization
+src/parser.py             pdfplumber ingestion, table/gutter detection, bbox normalization
 src/extractor.py          ParsedDocument → validated FinancialRecord
 src/vectorstore.py        chunking, local embedding, filtered retrieval
 src/chain.py              LCEL RAG chain, streaming, citation + numeric verification
@@ -243,5 +290,5 @@ one — page images never leave the machine. No real financial documents are in 
 ## License
 
 Synthetic fixtures and project code are provided as-is for educational use. Third-party
-dependencies retain their own licenses — Docling (MIT), ChromaDB (Apache-2.0),
-sentence-transformers (Apache-2.0), Streamlit (Apache-2.0), PyMuPDF (AGPL).
+dependencies retain their own licenses — pdfplumber (MIT), ChromaDB (Apache-2.0),
+Streamlit (Apache-2.0), PyMuPDF (AGPL).
