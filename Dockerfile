@@ -34,15 +34,26 @@ ENV HOME=/home/user \
 
 WORKDIR $HOME/app
 
-# torch from the CPU index, before requirements.txt so the resolver never sees the default
-# build. A plain `pip install torch` on Linux pulls the CUDA wheel and ~2.5 GB of libraries
-# this CPU-only service never calls; requirements.txt:47 carries the same instruction for
-# local installs.
+# torch AND torchvision from the CPU index, before requirements.txt so the resolver never
+# sees the default builds. A plain `pip install torch` on Linux pulls the CUDA wheel and
+# ~2.5 GB of libraries this CPU-only service never calls; requirements.txt:47 carries the
+# same instruction for local installs.
+#
+# torchvision has to be named explicitly even though nothing here asks for it directly.
+# docling-ibm-models depends on it, so leaving it to requirements.txt resolved it against
+# default PyPI — whose Linux wheel is compiled against the CUDA torch. The versions look
+# right and the image builds clean, then dies at startup with
+# "RuntimeError: operator torchvision::nms does not exist", because torchvision's compiled
+# ops cannot register against a +cpu torch. Installing the pair together from one index is
+# what keeps their ABI matched: 0.28.0+cpu rather than 0.28.0.
+#
+# This does not reproduce on Windows, where the wheels carry no such split — so it is
+# reachable only by building the image.
 #
 # Copied on its own so this layer is cached against everything except a dependency change.
 COPY --chown=user requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
 
 # api.py imports src/, and serves sample documents and the policy corpus out of
