@@ -1,7 +1,12 @@
-# Multimodal AI Financial Assistant — dependencies
+# Multimodal AI Financial Assistant — RUNTIME dependencies (api.py + src/)
 #
 # RULE 1 (rules.md): every line here is free. No paid tiers, no credit card, no license keys.
 # Cost annotation is mandatory on every dependency.
+#
+# This file is what gets installed in the 512 MB deployment, so it holds only what the
+# FastAPI backend imports. The Streamlit dashboard, the eval suite and the test tooling
+# live in requirements-dev.txt — together they pulled ragas, datasets, pyarrow, streamlit
+# and pandas into a container that never imports any of them.
 #
 # After a successful install, freeze exact versions:
 #     pip freeze > requirements.lock.txt
@@ -14,42 +19,38 @@ langchain>=0.3.0,<0.4
 langchain-core>=0.3.0,<0.4
 langchain-community>=0.3.0,<0.4
 
-# ── Document parsing (LOCAL, CPU) ─────────────────────────────────────────────
-# Docling: layout-aware PDF/image parsing with real table structure (TableFormer).
-# Cost: $0 (MIT, IBM Research). Runs fully local.
-# NOTE: first import downloads ~500 MB of layout/table models to the HuggingFace cache.
-#       One-time, free, offline thereafter. See phases.md Phase 1 task 3.
-docling>=2.0.0
-docling-core>=2.0.0
+# ── Document parsing (LOCAL, CPU, no models) ──────────────────────────────────
+# pdfplumber: text and table extraction from a PDF's own text layer, with coordinates.
+# Cost: $0 (MIT). Pure Python over pdfminer.six — no model weights, no torch.
+#
+# Replaced Docling in the 512 MB refactor. Docling was better: TableFormer recovered
+# tables from unruled layouts and RapidOCR read scanned pages. Both are neural models,
+# and torch alone is ~300 MB resident before a page is parsed. What is lost is stated in
+# src/parser.py rather than implied here: unruled tables and all scanned/image input.
+pdfplumber>=0.11.0
 
-# PDF page rendering for the high-resolution previewer (design.md §5.1).
+# PDF page rendering for the previewer, and the millisecond text-layer triage.
 # Cost: $0 (AGPL/commercial dual — AGPL is fine for this project; we do not redistribute).
 pymupdf>=1.24.0
-
-# Image handling for the vision fallback path.
-# Cost: $0 (HPND/OSS).
-pillow>=10.0.0
 
 # ── Vector store (LOCAL, on-disk) ─────────────────────────────────────────────
 # ChromaDB embedded PersistentClient. No server, no Docker, no cloud account.
 # Chosen over FAISS for metadata filtering (FR-3.4). Cost: $0 (Apache-2.0).
 chromadb>=0.5.0
-langchain-chroma>=0.1.4
 
-# ── Embeddings (LOCAL, CPU) ───────────────────────────────────────────────────
-# sentence-transformers/all-MiniLM-L6-v2 — 384-dim, ~80 MB, CPU-fast.
-# Financial text never leaves the machine at embed time. Cost: $0 (Apache-2.0).
-sentence-transformers>=3.0.0
+# ── Embeddings (CLOUD, FREE TIER) ─────────────────────────────────────────────
+# sentence-transformers/all-MiniLM-L6-v2, served by the HuggingFace Inference API rather
+# than loaded in-process. Same model, same 384 dimensions, so existing Chroma collections
+# stay readable. Cost: $0 (free tier, rate-limited). Needs HF_TOKEN.
+#
+# This REVERSES decision D-2 and the guarantee that financial text never leaves the
+# machine at embed time: chunk text is now sent to the endpoint. The trade buys the
+# ~300 MB that torch + sentence-transformers occupied. EMBEDDING_ENDPOINT_URL points the
+# same code at a self-hosted Text Embeddings Inference server if locality matters more.
 langchain-huggingface>=0.1.0
 
-# CPU-only torch. Install the CPU wheel explicitly to avoid pulling ~2.5 GB of CUDA
-# libraries onto a machine that will never use them (NFR-6: 8 GB RAM, CPU-only):
-#     pip install torch --index-url https://download.pytorch.org/whl/cpu
-# Cost: $0 (BSD).
-torch>=2.2.0
-
 # ── LLM provider (CLOUD, FREE TIER) ───────────────────────────────────────────
-# Groq: vision + reasoning. Free tier, no credit card required.
+# Groq: reasoning. Free tier, no credit card required.
 # Model IDs are NOT pinned here — they live in src/config.py (decision D-4). Cost: $0.
 langchain-groq>=0.2.0
 groq>=0.11.0
@@ -60,51 +61,25 @@ pydantic>=2.8.0
 pydantic-settings>=2.4.0
 python-dotenv>=1.0.0
 
-# ── Evaluation & observability ────────────────────────────────────────────────
-# Ragas: faithfulness, answer relevancy, context precision/recall.
-# Cost: $0 (Apache-2.0) — BUT it defaults to a PAID OpenAI judge. That default is
-# explicitly overridden to Groq + local MiniLM at the call site (rules.md Rule 1, D-10).
-#
-# !! CONFIRMED AT INSTALL (decision D-13): ragas HARD-REQUIRES the OpenAI SDK stack —
-#    it pulls in `openai`, `langchain-openai`, `tiktoken`, and `instructor` transitively,
-#    regardless of which judge we configure. These are installed but never called.
-#    The safeguard is NOT discipline, it is the absence of credentials: OPENAI_API_KEY
-#    must never exist in this environment, so an accidental fallback raises an auth
-#    error instead of quietly accruing cost. Enforced by scripts/verify_setup.py.
-ragas>=0.2.0
-datasets>=3.0.0
-
+# ── Observability ─────────────────────────────────────────────────────────────
 # LangSmith tracing. Free tier, 5k traces/month. OPTIONAL at runtime — the app must
 # run normally when LANGCHAIN_API_KEY is absent (D-11). Cost: $0.
 langsmith>=0.1.100
 
-# ── Data handling ─────────────────────────────────────────────────────────────
-# Cost: $0 (BSD).
-pandas>=2.2.0
-
-# ── Frontend ──────────────────────────────────────────────────────────────────
-# Two frontends now run against the same src/, which is what decision D-8 was for.
-# Cost: $0 (Apache-2.0 / MIT).
-#
-# Streamlit dashboard:  streamlit run app.py
-streamlit>=1.38.0
-#
+# ── API ───────────────────────────────────────────────────────────────────────
 # FastAPI backend for the Next.js frontend in frontend/:
 #   uvicorn api:app --port 8000
 # python-multipart is required for multipart/form-data uploads; FastAPI raises a clear
 # error without it, but only at request time, so it is pinned explicitly.
+# Cost: $0 (MIT/BSD).
 fastapi>=0.115.0
 uvicorn>=0.30.0
 python-multipart>=0.0.9
-
-# ── Development ───────────────────────────────────────────────────────────────
-# Cost: $0 (MIT/BSD).
-pytest>=8.0.0
-pytest-asyncio>=0.24.0
-mypy>=1.11.0
-ruff>=0.6.0
 
 # ── EXPLICITLY FORBIDDEN (rules.md Rule 1) ────────────────────────────────────
 # openai, anthropic, cohere, google-generativeai, pinecone-client, weaviate-client,
 # qdrant-client[cloud], unstructured[api], boto3 (Textract), azure-ai-formrecognizer
 # If any of these appear in `pip list` as a direct dependency, that is a Rule 1 breach.
+#
+# Note that ragas still drags the OpenAI SDK in transitively (decision D-13) — which is
+# now confined to requirements-dev.txt, so the deployed image no longer carries it at all.

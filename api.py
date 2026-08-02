@@ -72,16 +72,27 @@ ALLOWED_ORIGINS = get_settings().allowed_origin_list
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Load the heavy models before the first request rather than during it.
+    """Prepare the parsing stack and check the embedding endpoint.
 
-    Measured cold: Docling converter 8.6 s, MiniLM 3.6 s. Paying that here means the
-    first upload costs ~2 s rather than ~14 s (decision D-35).
+    Once this loaded Docling (8.6 s) and MiniLM (3.6 s) so the first upload did not pay
+    for them (decision D-35). Neither model exists any more — pdfplumber has no weights
+    and embeddings are an HTTP call — so this is now cheap, and the memory it used to
+    reserve is the point of the 512 MB refactor.
+
+    The embedding check is deliberately non-fatal. It is a network call against a
+    misconfigurable endpoint, and a process that refuses to boot without it takes the
+    health endpoint down with it — leaving no way to ask the running service what is
+    wrong. Failing here logs loudly and lets ``/api/health`` report ``embeddings_ok:
+    false``; the first upload then fails with the same actionable message.
     """
     configure_logging()
     ensure_directories()
-    logger.info("Warming Docling and embedding models...")
-    warm_up(with_ocr=False)
-    warm_embeddings()
+    warm_up()
+    try:
+        warm_embeddings()
+        logger.info("Embedding endpoint ready")
+    except AssistantError as exc:
+        logger.error("Embeddings unavailable — retrieval will fail until fixed: %s", exc)
     logger.info("FinLens API ready")
     yield
 
@@ -180,6 +191,10 @@ class ChatRequest(BaseModel):
 class HealthOut(BaseModel):
     status: str
     llm_configured: bool
+    #: Whether the embedding endpoint answered. False means retrieval is down even though
+    #: the process is up — the distinction the old local-model setup could not produce,
+    #: because embeddings could not fail independently of the service.
+    embeddings_configured: bool
     reasoning_model: str
     documents_loaded: int
     collections: dict[str, int]
@@ -267,6 +282,7 @@ def health() -> HealthOut:
     return HealthOut(
         status="ok",
         llm_configured=llm_available(),
+        embeddings_configured=get_settings().embeddings_configured,
         reasoning_model=MODELS_BY_ROLE["reasoning"],
         documents_loaded=len(_DOCUMENTS),
         collections=collections,
@@ -448,7 +464,6 @@ def samples() -> list[dict[str, str]]:
     catalogue = [
         ("AWS invoice", "clean_invoice.pdf"),
         ("Card statement", "multipage_statement.pdf"),
-        ("Scanned receipt", "scanned_receipt.png"),
         ("Unbalanced invoice", "unbalanced_invoice.pdf"),
     ]
     return [

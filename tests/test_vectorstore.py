@@ -191,15 +191,27 @@ def test_scores_are_similarities_not_distances(populated: None) -> None:
     assert hits[0].score >= hits[-1].score, "results are not ordered best-first"
 
 
-def test_policy_corpus_answers_a_why_question(populated: None) -> None:
+# These two measure semantic retrieval quality, which is the one thing the offline stub
+# cannot stand in for: a hash-derived vector has no meaning, so "why is my NAT gateway
+# charge so high" cannot land on the NAT Gateway policy. They need the real embedding
+# endpoint, and their own store — querying real vectors against a stub-embedded collection
+# would compare noise to noise and pass for the wrong reason.
+#
+# Marked integration, so the default offline run excludes them:
+#     pytest -m integration
+
+
+@pytest.mark.integration
+def test_policy_corpus_answers_a_why_question(live_policies: str) -> None:
     """The cross-document grounding the product exists to do."""
-    hits = retrieve("why is my NAT gateway charge so high", collection=TEST_POLICIES, k=3)
+    hits = retrieve("why is my NAT gateway charge so high", collection=live_policies, k=3)
     assert "NAT Gateway" in hits[0].snippet
     assert "per GB" in hits[0].snippet
 
 
-def test_policy_corpus_finds_the_hotel_cap(populated: None) -> None:
-    hits = retrieve("what is the nightly hotel spending limit", collection=TEST_POLICIES, k=3)
+@pytest.mark.integration
+def test_policy_corpus_finds_the_hotel_cap(live_policies: str) -> None:
+    hits = retrieve("what is the nightly hotel spending limit", collection=live_policies, k=3)
     assert any("200 per night" in c.snippet for c in hits)
 
 

@@ -33,6 +33,7 @@ from src.config import (
     CHUNK_SIZE,
     COLLECTION_DOCUMENTS,
     COLLECTION_POLICIES,
+    EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     get_settings,
 )
@@ -47,7 +48,6 @@ from src.schemas import (
 if TYPE_CHECKING:
     from chromadb.api.models.Collection import Collection
     from chromadb.api.types import Where
-    from langchain_huggingface import HuggingFaceEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -108,26 +108,68 @@ class Chunk(BaseModel):
 
 
 @lru_cache(maxsize=1)
-def _get_embeddings() -> HuggingFaceEmbeddings:
-    """The one embedding model in this system. Local, CPU, no network after first load."""
-    from langchain_huggingface import HuggingFaceEmbeddings
+def _get_embeddings() -> Any:
+    """The one embedding model in this system — called over HTTP, not loaded in-process.
 
-    logger.info("Loading local embedding model %s", EMBEDDING_MODEL)
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
+    **This reverses decision D-2**, under which embeddings were computed locally and
+    document text never left the machine at embed time. sentence-transformers pulls torch,
+    and torch alone is roughly 300 MB resident before a single vector is computed, which
+    does not fit a 512 MB deployment. See ``EMBEDDING_MODEL`` for why the *same* model is
+    still used: identical vectors, so existing Chroma collections stay readable.
+
+    Chunk text is sent to the endpoint. That is the trade being made, and it is the reason
+    ``embedding_endpoint_url`` exists — pointing it at a self-hosted Text Embeddings
+    Inference server restores the locality without touching this code.
+    """
+    from langchain_huggingface import HuggingFaceEndpointEmbeddings
+
+    settings = get_settings()
+    if not settings.embeddings_configured:
+        raise RetrievalError(
+            "No embedding endpoint is configured. Set HF_TOKEN (free at "
+            "hf.co/settings/tokens) or EMBEDDING_ENDPOINT_URL for a self-hosted "
+            "endpoint. Retrieval cannot run without one."
+        )
+
+    url = settings.embedding_endpoint_url.strip()
+    logger.info(
+        "Using remote embeddings: %s", url or f"HF Inference API ({EMBEDDING_MODEL})"
+    )
+    return HuggingFaceEndpointEmbeddings(
+        model=url or EMBEDDING_MODEL,
+        huggingfacehub_api_token=settings.hf_token.strip() or None,
     )
 
 
-def warm_up() -> None:
-    """Load the embedding model ahead of the first document.
+def _check_dimensions(vector: Sequence[float]) -> None:
+    """Fail loudly when the endpoint returns vectors of an unexpected width.
 
-    Measured: the first ``ingest_document`` took 3.62 s and every later one 0.14 s — the
-    difference is loading MiniLM. Doing it at startup moves that cost off the user's
-    first upload, where it is most visible.
+    Chroma fixes a collection's dimensionality at creation. Feeding it a differently sized
+    vector later raises deep inside the client on *insert*, long after the real mistake —
+    pointing ``EMBEDDING_MODEL`` or ``EMBEDDING_ENDPOINT_URL`` at a model that is not
+    384-dimensional. Worse, a query of the wrong width against a populated collection can
+    surface as empty results rather than an error, which reads as "retrieval found
+    nothing" instead of "the store and the model disagree".
     """
-    _get_embeddings().embed_query("warm up")
+    actual = len(vector)
+    if actual != EMBEDDING_DIMENSIONS:
+        raise RetrievalError(
+            f"The embedding endpoint returned {actual}-dimensional vectors, but the Chroma "
+            f"collections are built for {EMBEDDING_DIMENSIONS} ({EMBEDDING_MODEL}). Point "
+            f"the endpoint at a {EMBEDDING_DIMENSIONS}-dim model, or change "
+            f"EMBEDDING_DIMENSIONS and delete data/chroma/ so the collections are rebuilt "
+            f"— they cannot be migrated in place."
+        )
+
+
+def warm_up() -> None:
+    """Check the embedding endpoint ahead of the first document.
+
+    Cheaper than it was — there is no model to load — but more valuable: it turns a
+    missing token or a mismatched model into a startup error instead of a failure on the
+    user's first upload.
+    """
+    _check_dimensions(_get_embeddings().embed_query("warm up"))
 
 
 @lru_cache(maxsize=1)
@@ -256,7 +298,12 @@ def build_chunks(
 def _embed(texts: list[str]) -> list[Sequence[float]]:
     # Widened to Sequence: Chroma's signature accepts list[Sequence[float]], and list is
     # invariant, so list[list[float]] would not satisfy it.
-    return list(_get_embeddings().embed_documents(texts))
+    vectors = list(_get_embeddings().embed_documents(texts))
+    if vectors:
+        # Checked on the way in, where the error can still name the cause. Chroma would
+        # otherwise reject the insert with a message about the collection, not the model.
+        _check_dimensions(vectors[0])
+    return vectors
 
 
 def _add_chunks(chunks: list[Chunk], collection_name: str) -> int:

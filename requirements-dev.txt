@@ -1,0 +1,45 @@
+# Multimodal AI Financial Assistant — DEVELOPMENT, EVAL and STREAMLIT dependencies
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Split out of requirements.txt during the 512 MB refactor. None of this is imported by
+# api.py or src/ at runtime, and together it is the larger half of the install: ragas
+# pulls the OpenAI SDK, tiktoken and instructor, datasets pulls pyarrow, and streamlit
+# pulls its own server stack. Installing it in the deployed container spent memory and
+# image size on code that never runs there.
+#
+# RULE 1 still applies: every line is free.
+
+-r requirements.txt
+
+# ── Streamlit dashboard (the other frontend, decision D-8) ────────────────────
+#     streamlit run app.py
+# Cost: $0 (Apache-2.0).
+streamlit>=1.38.0
+
+# ── Evaluation (src/evals.py) ─────────────────────────────────────────────────
+# Ragas: faithfulness, answer relevancy, context precision/recall.
+# Cost: $0 (Apache-2.0) — BUT it defaults to a PAID OpenAI judge. That default is
+# explicitly overridden to Groq + local MiniLM at the call site (rules.md Rule 1, D-10).
+#
+# !! CONFIRMED AT INSTALL (decision D-13): ragas HARD-REQUIRES the OpenAI SDK stack —
+#    it pulls in `openai`, `langchain-openai`, `tiktoken`, and `instructor` transitively,
+#    regardless of which judge we configure. These are installed but never called.
+#    The safeguard is NOT discipline, it is the absence of credentials: OPENAI_API_KEY
+#    must never exist in this environment, so an accidental fallback raises an auth
+#    error instead of quietly accruing cost. Enforced by scripts/verify_setup.py.
+ragas>=0.2.0
+datasets>=3.0.0
+
+# Ragas scores answer relevancy with an embedding model. The eval suite runs on a
+# developer machine rather than the 512 MB box, so it can afford the local one — and
+# should, since a rate-limited free endpoint would make a ~100-call scoring run
+# unreliable for reasons unrelated to what is being measured.
+sentence-transformers>=3.0.0
+
+# ── Test and lint tooling ─────────────────────────────────────────────────────
+# Cost: $0 (MIT/BSD).
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+mypy>=1.11.0
+ruff>=0.6.0
